@@ -51,6 +51,11 @@ class TileSet:
         """Check if this set is valid according to Rummikub rules"""
         if len(self.tiles) < 3:
             return False
+        
+        # Check for duplicate tiles (same tile_id)
+        tile_ids = [t.tile_id for t in self.tiles]
+        if len(tile_ids) != len(set(tile_ids)):
+            return False  # Duplicate tiles not allowed!
             
         if self.set_type == "group":
             return self._is_valid_group()
@@ -59,11 +64,13 @@ class TileSet:
         return False
     
     def _is_valid_group(self) -> bool:
-        """Check if tiles form a valid group (3-4 same numbers, different colors)"""
+        """
+        Check if tiles form a valid group.
+        Rules: 3-4 tiles, same number, different colors, no duplicates
+        """
         if len(self.tiles) < 3 or len(self.tiles) > 4:
             return False
         
-        # Extract numbers (handling jokers)
         numbers = []
         colors = []
         joker_count = 0
@@ -76,61 +83,108 @@ class TileSet:
                 colors.append(tile.color)
         
         # All non-joker tiles must have the same number
-        if len(set(numbers)) > 1:
+        if len(numbers) > 0 and len(set(numbers)) > 1:
             return False
         
-        # All non-joker tiles must have different colors
+        # All non-joker tiles must have different colors (no duplicates)
         if len(colors) != len(set(colors)):
+            return False
+        
+        # A group can have at most 4 tiles (one per color)
+        if len(self.tiles) > 4:
             return False
         
         return True
     
     def _is_valid_run(self) -> bool:
-        """Check if tiles form a valid run (3+ consecutive numbers, same color)"""
+        """
+        Check if tiles form a valid run.
+        Rules: 3+ consecutive numbers, same color, no duplicates
+        """
         if len(self.tiles) < 3:
             return False
         
-        # Extract colors and numbers (handling jokers)
         colors = []
         numbers = []
-        joker_positions = []
+        joker_count = 0
         
-        for i, tile in enumerate(self.tiles):
+        for tile in self.tiles:
             if tile.tile_type == TileType.JOKER:
-                joker_positions.append(i)
+                joker_count += 1
             else:
                 colors.append(tile.color)
                 numbers.append(tile.number)
         
         # All non-joker tiles must have the same color
-        if len(set(colors)) > 1:
+        if len(colors) > 0 and len(set(colors)) > 1:
+            return False
+        
+        # Check for duplicate numbers (can't have B7, B7 in same run)
+        if len(numbers) != len(set(numbers)):
             return False
         
         # Check if numbers form a consecutive sequence
         if len(numbers) > 0:
             numbers.sort()
-            # With jokers, check if we can fill gaps
-            expected_length = len(self.tiles)
+            
+            # With jokers, we need to check if the gaps can be filled
             min_num = numbers[0]
             max_num = numbers[-1]
+            expected_length = max_num - min_num + 1
             
-            # Check if the range is valid
-            if max_num - min_num + 1 > expected_length:
+            # Total tiles should equal the range
+            if expected_length != len(self.tiles):
                 return False
             
-            # Check if numbers with jokers can form consecutive sequence
-            all_positions = list(range(min_num, max_num + 1))
-            missing_count = len(all_positions) - len(numbers)
+            # Check that we have the right number of jokers to fill gaps
+            all_numbers_in_range = set(range(min_num, max_num + 1))
+            missing_numbers = all_numbers_in_range - set(numbers)
             
-            if missing_count != len(joker_positions):
+            if len(missing_numbers) != joker_count:
                 return False
         
         return True
     
     def get_value(self) -> int:
-        """Returns the total value of tiles in this set"""
-        return sum(tile.get_value() if tile.tile_type != TileType.JOKER 
-                   else 0 for tile in self.tiles)
+        """Returns the total value of tiles in this set (jokers count as 0)"""
+        total = 0
+        for tile in self.tiles:
+            if tile.tile_type == TileType.JOKER:
+                # For initial meld calculation, joker represents a tile value
+                # But for hand penalty, it's 30
+                # Here we return 0 and handle it contextually
+                total += 0
+            else:
+                total += tile.number
+        return total
+    
+    def get_meld_value(self) -> int:
+        """
+        Returns value for initial meld purposes.
+        For initial meld, jokers take the value they represent.
+        """
+        if self.set_type == "group":
+            # In a group, joker represents the same number as other tiles
+            non_joker_tiles = [t for t in self.tiles if t.tile_type != TileType.JOKER]
+            if non_joker_tiles:
+                number = non_joker_tiles[0].number
+                return number * len(self.tiles)
+            return 0
+        elif self.set_type == "run":
+            # In a run, calculate the sum including joker values
+            total = 0
+            non_joker_tiles = [t for t in self.tiles if t.tile_type != TileType.JOKER]
+            if non_joker_tiles:
+                non_joker_tiles.sort(key=lambda t: t.number)
+                min_num = non_joker_tiles[0].number
+                max_num = non_joker_tiles[-1].number
+                # Sum of arithmetic sequence
+                expected_length = len(self.tiles)
+                actual_min = min_num - sum(1 for t in self.tiles[:self.tiles.index(non_joker_tiles[0])] 
+                                          if t.tile_type == TileType.JOKER)
+                total = sum(range(actual_min, actual_min + expected_length))
+            return total
+        return 0
 
 
 class RummikubAction:
@@ -138,7 +192,7 @@ class RummikubAction:
     def __init__(self, action_type: str, tiles: List[Tile] = None, 
                  sets: List[TileSet] = None, table_config: List[TileSet] = None):
         """
-        action_type: 'draw', 'initial_meld', 'play', 'end_turn'
+        action_type: 'draw', 'initial_meld', 'play'
         tiles: tiles from hand being played
         sets: new sets being formed
         table_config: complete table configuration after manipulation
@@ -165,6 +219,9 @@ class RummikubEnv:
         
         # For reward calculation
         self.previous_hand_values: List[int] = [0, 0]
+        
+        # Import the hybrid action generator (to be implemented)
+        self.action_generator = None  # Will be set externally
         
         self._initialize_deck()
     
@@ -250,9 +307,20 @@ class RummikubEnv:
     def get_legal_actions(self, player: int) -> List[RummikubAction]:
         """
         Get all legal actions for the current player.
-        This is where you'd integrate with your ILP solver.
         
-        For now, returns basic actions: draw or play valid sets
+        This method should call your HybridActionGenerator.
+        
+        Instructions:
+        1. Create an instance of HybridActionGenerator (see separate file)
+        2. Call: self.action_generator.generate_all_legal_actions(
+                    hand_tiles=self.player_hands[player],
+                    table_sets=self.table,
+                    has_melded=self.has_melded[player],
+                    pool_size=len(self.tiles_deck)
+                 )
+        3. The generator will return a list of RummikubAction objects
+        
+        For now, this returns basic actions for testing.
         """
         legal_actions = []
         
@@ -260,65 +328,60 @@ class RummikubEnv:
         if len(self.tiles_deck) > 0:
             legal_actions.append(RummikubAction(action_type='draw'))
         
-        # Option 2: Play tiles from hand
-        if self.has_melded[player]:
-            # Player has already made initial meld, can do any valid play
-            # TODO: Integrate ILP solver here to find all valid plays
-            legal_actions.extend(self._find_valid_plays(player))
+        # Option 2: Use action generator if available
+        if self.action_generator is not None:
+            legal_actions.extend(
+                self.action_generator.generate_all_legal_actions(
+                    hand_tiles=self.player_hands[player],
+                    table_sets=self.table,
+                    has_melded=self.has_melded[player],
+                    pool_size=len(self.tiles_deck)
+                )
+            )
         else:
-            # Player needs to make initial meld (30+ points)
-            legal_actions.extend(self._find_valid_initial_melds(player))
+            # Fallback: basic action generation for testing
+            if self.has_melded[player]:
+                legal_actions.extend(self._find_valid_plays(player))
+            else:
+                legal_actions.extend(self._find_valid_initial_melds(player))
         
         return legal_actions
     
     def _find_valid_initial_melds(self, player: int) -> List[RummikubAction]:
         """
-        Find all valid initial melds (sets that sum to 30+ points).
-        This should call your ILP solver.
+        
+        What you should do:
+        - Remove this method entirely, OR
+        - Keep it as a simple fallback for testing
+        
+        The HybridActionGenerator will handle this properly.
         """
-        # Placeholder: basic implementation
-        # TODO: Replace with ILP solver
-        valid_melds = []
-        hand = self.player_hands[player]
-        
-        # Try to find combinations that sum to >= 30
-        # This is simplified - you'll want to use ILP solver
-        for i in range(len(hand)):
-            for j in range(i+1, len(hand)):
-                for k in range(j+1, len(hand)):
-                    test_set = TileSet(tiles=[hand[i], hand[j], hand[k]], 
-                                      set_type='group')
-                    if test_set.is_valid() and test_set.get_value() >= 30:
-                        action = RummikubAction(
-                            action_type='initial_meld',
-                            tiles=[hand[i], hand[j], hand[k]],
-                            sets=[test_set],
-                            table_config=self.table + [test_set]
-                        )
-                        valid_melds.append(action)
-        
-        return valid_melds
+        # Simple placeholder - just returns empty list
+        return []
     
     def _find_valid_plays(self, player: int) -> List[RummikubAction]:
         """
-        Find all valid plays after initial meld.
-        This should call your ILP solver for complex manipulations.
+        
+        What you should do:
+        - Remove this method entirely, OR  
+        - Keep it as a simple fallback for testing
+        
+        The HybridActionGenerator will handle this properly.
         """
-        # Placeholder: basic implementation
-        # TODO: Replace with ILP solver
+        # Simple placeholder - just returns empty list
         return []
     
     def step(self, action: RummikubAction) -> Tuple[Dict, float, bool, Dict]:
         """
         Execute an action and return (state, reward, done, info)
         
-        Implements the user's reward function:
+        Updated reward function:
         1. R_t = (Sum of hand at t-1) - (Sum of hand at t)
-        2. Win: R_T = 200 + sum of opponent's hand
-        3. Lose: R_T = -sum of my hand
-        4. Ice-breaking bonus: +20
-        5. Drawing penalty: -5
-        6. Joker penalty at end: -30 per joker
+        2. Win by empty hand: R_T = 200 + sum of opponent's hand
+        3. Win by lowest hand: R_T = +10
+        4. Lose by lowest hand: R_T = -10
+        5. Ice-breaking bonus: +20
+        6. Drawing penalty: -5
         """
         if self.game_over:
             raise ValueError("Game is already over")
@@ -361,9 +424,8 @@ class RummikubEnv:
                 info['tiles_played'] = len(action.tiles)
                 reward += 20  # Ice-breaking bonus
             else:
-                # Invalid meld - mark as invalid
+                # Invalid meld
                 info['invalid_action'] = True
-                # Don't apply penalty in reward, handle this separately if needed
                 
         elif action.action_type == 'play':
             # Player plays tiles (after initial meld)
@@ -388,13 +450,13 @@ class RummikubEnv:
         # Check termination conditions
         done = False
         
-        # Condition 1: Current player has no tiles left (WIN)
+        # Condition 1: Current player has no tiles left (WIN by empty hand)
         if len(self.player_hands[self.current_player]) == 0:
             self.game_over = True
             self.winner = self.current_player
             done = True
             
-            # Calculate terminal reward for winner
+            # Terminal reward: 200 + opponent's hand value
             opponent = 1 - self.current_player
             opponent_hand_value = self._calculate_hand_value(opponent)
             reward = 200 + opponent_hand_value
@@ -403,44 +465,49 @@ class RummikubEnv:
             info['win_type'] = 'emptied_hand'
             info['winner'] = self.current_player
         
-        # Condition 2: No more tiles in pool and no possible moves
+        # Condition 2: No more tiles in pool
         elif len(self.tiles_deck) == 0:
-            # Check if current player has any legal actions besides draw
-            legal_actions = self.get_legal_actions(self.current_player)
-            legal_actions = [a for a in legal_actions if a.action_type != 'draw']
+            # Check if anyone can make a move
+            current_can_play = len(self.get_legal_actions(self.current_player)) > 1  # >1 because draw always exists
+            next_player = 1 - self.current_player
             
-            if len(legal_actions) == 0:
-                # Game ends, determine winner by hand value
+            # Switch to next player temporarily to check their actions
+            temp_current = self.current_player
+            self.current_player = next_player
+            next_can_play = len(self.get_legal_actions(next_player)) > 1
+            self.current_player = temp_current
+            
+            # If neither player can play, game ends
+            if not current_can_play and not next_can_play:
                 self.game_over = True
                 done = True
                 
+                # Determine winner by lowest hand value
                 player_value = self._calculate_hand_value(self.current_player)
                 opponent_value = self._calculate_hand_value(1 - self.current_player)
                 
-                # Apply joker penalties
-                player_jokers = self._count_jokers_in_hand(self.current_player)
-                opponent_jokers = self._count_jokers_in_hand(1 - self.current_player)
+                info['jokers_in_hand'] = self._count_jokers_in_hand(self.current_player)
+                info['final_my_hand_value'] = player_value
+                info['final_opponent_hand_value'] = opponent_value
                 
-                player_total = player_value  # Joker already worth 30 in calculation
-                opponent_total = opponent_value
-                
-                info['jokers_in_hand'] = player_jokers
-                
-                if player_total < opponent_total:
+                if player_value < opponent_value:
                     # Current player wins
                     self.winner = self.current_player
-                    reward = 200 + opponent_total
+                    reward = 10  # Winner gets +10
                     info['win_type'] = 'lowest_hand'
                     info['winner'] = self.current_player
-                else:
+                elif opponent_value < player_value:
                     # Current player loses
                     self.winner = 1 - self.current_player
-                    reward = -player_total
+                    reward = -10  # Loser gets -10
                     info['win_type'] = 'lowest_hand'
                     info['winner'] = 1 - self.current_player
-                
-                info['final_my_hand_value'] = player_total
-                info['final_opponent_hand_value'] = opponent_total
+                else:
+                    # Tie - no winner
+                    self.winner = None
+                    reward = 0
+                    info['win_type'] = 'tie'
+                    info['winner'] = None
         
         # Update previous hand value for next turn
         self.previous_hand_values[self.current_player] = hand_value_after
@@ -457,11 +524,20 @@ class RummikubEnv:
         """Validate that initial meld is legal (30+ points)"""
         if not action.sets:
             return False
-        total_value = sum(s.get_value() for s in action.sets)
+        
+        # Calculate total value (for initial meld, jokers count as their represented value)
+        total_value = sum(s.get_meld_value() for s in action.sets)
+        
+        # Check all sets are valid
         all_valid = all(s.is_valid() for s in action.sets)
+        
         # Check tiles come from player's hand
         all_tiles_in_hand = all(t in self.player_hands[self.current_player] 
                                 for t in action.tiles)
+        
+        # Check no tiles are used from table (initial meld can't use table)
+        # action.table_config should only contain the new sets
+        
         return total_value >= 30 and all_valid and all_tiles_in_hand
     
     def _validate_play(self, action: RummikubAction) -> bool:
@@ -469,10 +545,31 @@ class RummikubEnv:
         # Check that all resulting sets on table are valid
         if action.table_config is None:
             return False
+        
         # Check tiles come from player's hand
         all_tiles_in_hand = all(t in self.player_hands[self.current_player] 
                                 for t in action.tiles)
-        return all(s.is_valid() for s in action.table_config) and all_tiles_in_hand
+        
+        # Check all sets in new configuration are valid
+        all_sets_valid = all(s.is_valid() for s in action.table_config)
+        
+        # Check that all tiles are accounted for (hand tiles + table tiles = new table tiles)
+        # Count tiles: tiles from table + tiles from hand = tiles in new table
+        table_tiles = []
+        for tile_set in self.table:
+            table_tiles.extend(tile_set.tiles)
+        
+        new_table_tiles = []
+        for tile_set in action.table_config:
+            new_table_tiles.extend(tile_set.tiles)
+        
+        # Tiles in new table should be: old table tiles + tiles played from hand
+        expected_tile_ids = set(t.tile_id for t in table_tiles) | set(t.tile_id for t in action.tiles)
+        actual_tile_ids = set(t.tile_id for t in new_table_tiles)
+        
+        tiles_match = expected_tile_ids == actual_tile_ids
+        
+        return all_tiles_in_hand and all_sets_valid and tiles_match
     
     def _apply_meld(self, action: RummikubAction):
         """Apply initial meld to game state"""
@@ -515,7 +612,10 @@ class RummikubEnv:
         
         if self.game_over:
             print(f"\n{'='*60}")
-            print(f"GAME OVER! Winner: Player {self.winner}")
+            if self.winner is not None:
+                print(f"GAME OVER! Winner: Player {self.winner}")
+            else:
+                print(f"GAME OVER! Tie!")
             print(f"{'='*60}")
 
 
