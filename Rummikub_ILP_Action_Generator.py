@@ -8,7 +8,7 @@ Modes:
 3. ILP_ONLY: Pure ILP solver (complete)
 
 Usage:
-    from complete_action_generator import ActionGenerator, SolverMode
+    from Rummikub_ILP_Action_Generator import ActionGenerator, SolverMode
     
     generator = ActionGenerator(mode=SolverMode.HYBRID)
     env.action_generator = generator
@@ -105,10 +105,7 @@ class ActionGenerator:
         legal_actions = []
         self.stats['total_calls'] += 1
         
-        # Always include: Draw action
-        if pool_size > 0:
-            legal_actions.append(RummikubAction(action_type='draw'))
-        
+        # Generate play actions first
         if has_melded:
             # After initial meld
             if self.mode == SolverMode.HEURISTIC_ONLY:
@@ -121,6 +118,10 @@ class ActionGenerator:
             # Before initial meld
             legal_actions.extend(self._generate_initial_meld_actions(hand_tiles))
         
+        # Always include draw action at the end (only once!)
+        if pool_size > 0:
+            legal_actions.append(RummikubAction(action_type='draw'))
+        
         return legal_actions
     
     # =========================================================================
@@ -130,11 +131,29 @@ class ActionGenerator:
     def _generate_initial_meld_actions(self, hand_tiles: List) -> List:
         """Generate all initial meld actions (>= 30 points)."""
         from Rummikub_env import RummikubAction
+        import time
         
         legal_actions = []
+        start_time = time.time()
+        max_search_time = 5.0  # 5 seconds max
+        max_actions = 100  # Stop after finding 100 actions
         
+        # Try subsets of hand, starting from larger
         for size in range(len(hand_tiles), 2, -1):
+            # Check timeout
+            if time.time() - start_time > max_search_time:
+                print(f"  (Search timeout after {max_search_time}s, found {len(legal_actions)} melds)")
+                break
+            
+            # Limit combinations to try (avoid exponential explosion)
+            max_combinations = 1000 if size > 10 else 10000
+            tried = 0
+            
             for tile_combo in combinations(hand_tiles, size):
+                tried += 1
+                if tried > max_combinations:
+                    break
+                
                 tile_list = list(tile_combo)
                 partitions = self._find_all_valid_partitions(tile_list)
                 
@@ -154,6 +173,10 @@ class ActionGenerator:
                         )
                         legal_actions.append(action)
                         self.stats['heuristic_actions'] += 1
+                        
+                        # Stop if found enough
+                        if len(legal_actions) >= max_actions:
+                            return legal_actions
         
         return legal_actions
     
@@ -691,15 +714,8 @@ class ActionGenerator:
         
         return legal_actions
     
-    """
-    Continuation of ActionGenerator class - Helper Methods
-    This contains the remaining methods for the complete implementation.
-
-    Add these methods to the ActionGenerator class from complete_action_generator.py
-    """
-
     def _identify_promising_subsets(self, hand_tiles: List, table_sets: List) -> List[List]:
-        """Generate promising hand subsets for ILP (hybrid mode)."""
+        """Generate promising hand subsets for ILP."""
         from Rummikub_env import TileType
         from collections import defaultdict
         
@@ -822,6 +838,24 @@ class ActionGenerator:
     def get_stats(self) -> Dict:
         """Return statistics about action generation."""
         return self.stats.copy()
+    
+    def _identify_promising_subsets(self, hand_tiles: List, table_sets: List) -> List[List]:
+        """Generate promising hand subsets for ILP."""
+        from Rummikub_env import TileType
+        from collections import defaultdict
+        
+        promising = []
+        
+        # Get table info
+        table_colors = set()
+        table_numbers = set()
+        for tile_set in table_sets:
+            for tile in tile_set.tiles:
+                if tile.tile_type != TileType.JOKER:
+                    table_colors.add(tile.color)
+
+
+    
 
 
 # ========================================================================
