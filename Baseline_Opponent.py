@@ -481,7 +481,7 @@ class ILPOpponent:
     
     def _generate_all_set_templates(self):
         """Generate all possible set templates (simplified)."""
-        from complete_action_generator import SetTemplate
+        from Rummikub_ILP_Action_Generator import SetTemplate
         from itertools import combinations
         
         templates = []

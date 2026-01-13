@@ -1,649 +1,296 @@
 """
-Complete Rummikub Action Generator - All-in-One
-Includes all 3 modes + complete ILP implementation
+Rummikub Action Generator using ILP and Heuristics
 
-Modes:
-1. HEURISTIC_ONLY: Fast, uses only heuristics
-2. HYBRID: Heuristics + ILP for complex cases (recommended)
-3. ILP_ONLY: Pure ILP solver (complete)
+Provides three types of action generation:
+1. Generator 1: Simple hand plays (no table manipulation)
+2. Generator 2: Table extensions (add to existing sets)
+3. Generator 3: Complex rearrangements (windowed search with backtracking)
+
+IMPORTANT: These generators ONLY provide action choices.
+The environment validates ice-breaking and determines if actions are legal.
+
+ACTION GENERATOR MODES
+══════════════════════
+
+MODE 1: HEURISTIC_ONLY (Fastest ~10ms)
+  • Uses: Generator 1 (Hand Plays) + Generator 2 (Table Extensions)
+  • Generator 1: Finds all valid sets from YOUR HAND ONLY
+  • Generator 2: Extends EXISTING table sets
+  • Missing: Generator 3 (complex rearrangements)
+  
+MODE 2: HYBRID (Balanced ~100ms) ⭐ RECOMMENDED
+  • Uses: ALL THREE Generators
+  • Finds most moves without being too slow
+  
+MODE 3: ILP_ONLY (Complete ~1s)
+  • Uses: All generators with HIGHER limits
+  • Finds virtually all possible moves
 
 Usage:
     from Rummikub_ILP_Action_Generator import ActionGenerator, SolverMode
     
-    generator = ActionGenerator(mode=SolverMode.HYBRID)
-    env.action_generator = generator
+    # Fast mode - Generators 1+2 only (~10ms)
+    gen = ActionGenerator(mode=SolverMode.HEURISTIC_ONLY)
+    
+    # Balanced mode - All generators with limits (~100ms, recommended)
+    gen = ActionGenerator(mode=SolverMode.HYBRID, max_ilp_calls=30)
+    
+    # Complete mode - Full search (~1s)
+    gen = ActionGenerator(mode=SolverMode.ILP_ONLY)
+    
+    # Generate actions
+    env.action_generator = gen
+    actions = env.get_legal_actions(player_id)
 """
 
 import numpy as np
-from typing import List, Tuple, Set, Dict, Optional
-from itertools import combinations, permutations
-from dataclasses import dataclass
+from typing import List, Set, Tuple, Optional, Dict
+from itertools import combinations, product
 from enum import Enum
+from dataclasses import dataclass
 import copy
-import time
 
 try:
     from ortools.linear_solver import pywraplp
     HAS_ORTOOLS = True
 except ImportError:
     HAS_ORTOOLS = False
-    print("WARNING: ortools not installed. Install with: pip install ortools")
-
-
-class SolverMode(Enum):
-    """Action generation modes"""
-    HEURISTIC_ONLY = "heuristic"  # Fast, incomplete (~80% coverage)
-    HYBRID = "hybrid"              # Balanced (recommended)
-    ILP_ONLY = "ilp"              # Complete, slower
+    print("WARNING: ortools not available. Install with: pip install ortools")
 
 
 @dataclass
 class SetTemplate:
-    """Template for a valid Rummikub set"""
-    set_type: str  # 'run' or 'group'
-    pattern: List[Tuple[Optional[int], Optional[int]]]
-    joker_count: int
-    template_id: int
+    """
+    Template representing a possible set configuration.
+    Used by ILP baseline opponent to enumerate all possible sets.
+    """
+    set_type: str        # 'run' or 'group'
+    pattern: List[Tuple] # [(color, number), ...] or [('JOKER', 'JOKER'), ...]
+    joker_count: int     # Number of jokers in this template
+    template_id: int     # Unique ID
+
+
+class SolverMode(Enum):
+    """Action generator modes with different speed/completeness tradeoffs"""
+    HEURISTIC_ONLY = "heuristic_only"  # Fast (~10ms), Generator 1+2 only
+    HYBRID = "hybrid"  # Balanced (~100ms), All generators with limits
+    ILP_ONLY = "ilp_only"  # Complete (~1s), Full ILP search
 
 
 class ActionGenerator:
     """
-    Complete action generator with 3 modes.
-    All TODOs are implemented.
+    Main action generator coordinating three sub-generators.
+    
+    Generator 1: Simple hand plays - forms valid sets from hand tiles only
+    Generator 2: Table extensions - adds tiles to existing table sets  
+    Generator 3: Rearrangements - manipulates table using windowed search
+    
+    The environment decides if ice is broken and validates actions.
     """
     
-    def __init__(self, mode: SolverMode = SolverMode.HYBRID, 
-                 max_ilp_calls: int = 50,
-                 ilp_time_limit: float = 1.0):
+    def __init__(self, mode: SolverMode = SolverMode.HYBRID, max_ilp_calls: int = 30):
         """
         Args:
-            mode: Solver mode (HEURISTIC_ONLY, HYBRID, or ILP_ONLY)
-            max_ilp_calls: Maximum ILP solver calls per turn
-            ilp_time_limit: Time limit per ILP solve in seconds
+            mode: Generation strategy (speed vs completeness tradeoff)
+            max_ilp_calls: Maximum number of windows for Generator 3
         """
         self.mode = mode
         self.max_ilp_calls = max_ilp_calls
-        self.ilp_time_limit = ilp_time_limit
         
-        if mode in [SolverMode.HYBRID, SolverMode.ILP_ONLY] and not HAS_ORTOOLS:
-            print(f"WARNING: Mode {mode} requires ortools. Falling back to HEURISTIC_ONLY")
-            self.mode = SolverMode.HEURISTIC_ONLY
+        # Initialize sub-generators
+        self.hand_play_gen = HandPlayGenerator()
+        self.table_ext_gen = TableExtensionGenerator()
         
-        # Pre-compute all 1174 possible valid set templates
-        print("Generating set templates...")
-        self.all_possible_sets = self._generate_all_set_templates()
-        print(f"Generated {len(self.all_possible_sets)} set templates")
-        
-        # For ILP solver
-        self.current_hand = []
-        self.current_table = []
-        
-        # Statistics
-        self.stats = {
-            'heuristic_actions': 0,
-            'ilp_actions': 0,
-            'total_calls': 0,
-            'ilp_time_total': 0.0
-        }
-    
-    # =========================================================================
-    # MAIN ENTRY POINT
-    # =========================================================================
-    
-    def generate_all_legal_actions(self,
-                                   hand_tiles: List,
-                                   table_sets: List,
-                                   has_melded: bool,
-                                   pool_size: int) -> List:
-        """Generate ALL legal actions for current state."""
-        from Rummikub_env import RummikubAction
-        
-        # Store state for ILP solver
-        self.current_hand = hand_tiles
-        self.current_table = table_sets
-        
-        legal_actions = []
-        self.stats['total_calls'] += 1
-        
-        # Generate play actions first
-        if has_melded:
-            # After initial meld
-            if self.mode == SolverMode.HEURISTIC_ONLY:
-                legal_actions.extend(self._generate_heuristic_actions(hand_tiles, table_sets))
-            elif self.mode == SolverMode.HYBRID:
-                legal_actions.extend(self._generate_hybrid_actions(hand_tiles, table_sets))
-            elif self.mode == SolverMode.ILP_ONLY:
-                legal_actions.extend(self._generate_ilp_only_actions(hand_tiles, table_sets))
+        if mode != SolverMode.HEURISTIC_ONLY:
+            self.rearrange_gen = RearrangementGenerator(
+                max_windows=max_ilp_calls,
+                max_melds_per_window=10
+            )
         else:
-            # Before initial meld
-            legal_actions.extend(self._generate_initial_meld_actions(hand_tiles))
+            self.rearrange_gen = None
         
-        # Always include draw action at the end (only once!)
-        if pool_size > 0:
-            legal_actions.append(RummikubAction(action_type='draw'))
+        print(f"ActionGenerator initialized:")
+        print(f"  Mode: {mode.value}")
+        print(f"  Max windows: {max_ilp_calls}")
+    
+    def generate_all_legal_actions(self, hand_tiles: List, table_sets: List, 
+                                   has_melded: bool, pool_size: int) -> List:
+        """
+        Generate all legal action choices for current state.
+        (Called by RummikubEnv.get_legal_actions)
         
-        return legal_actions
+        Args:
+            hand_tiles: List of Tile objects in player's hand
+            table_sets: List of TileSet objects on the table
+            has_melded: Whether player has broken the ice (30+ points)
+            pool_size: Number of tiles in pool (not used, but required by interface)
+            
+        Returns:
+            List of RummikubAction objects (NOT including 'draw' - env adds that)
+        """
+        return self.generate_actions(hand_tiles, table_sets, has_melded)
     
-    # =========================================================================
-    # INITIAL MELD
-    # =========================================================================
-    
-    def _generate_initial_meld_actions(self, hand_tiles: List) -> List:
-        """Generate all initial meld actions (>= 30 points)."""
+    def generate_actions(self, hand: List, table: List, has_melded: bool) -> List:
+        """
+        Internal method to generate all legal action choices.
+        
+        Args:
+            hand: List of Tile objects in player's hand
+            table: List of TileSet objects on the table
+            has_melded: Whether player has broken the ice (30+ points)
+            
+        Returns:
+            List of RummikubAction objects (NOT including 'draw')
+        """
         from Rummikub_env import RummikubAction
-        import time
         
-        legal_actions = []
-        start_time = time.time()
-        max_search_time = 5.0  # 5 seconds max
-        max_actions = 100  # Stop after finding 100 actions
+        actions = []
         
-        # Try subsets of hand, starting from larger
-        for size in range(len(hand_tiles), 2, -1):
-            # Check timeout
-            if time.time() - start_time > max_search_time:
-                print(f"  (Search timeout after {max_search_time}s, found {len(legal_actions)} melds)")
-                break
+        # NOTE: Environment adds 'draw' action automatically,
+        # so we don't include it here
+        
+        if not has_melded:
+            # Before ice-breaking: find initial melds (30+ points from hand only)
+            initial_melds = self.hand_play_gen.generate_initial_melds(hand)
+            actions.extend(initial_melds)
+        else:
+            # After ice-breaking: use all generators
             
-            # Limit combinations to try (avoid exponential explosion)
-            max_combinations = 1000 if size > 10 else 10000
-            tried = 0
+            # Generator 1: Simple hand plays (new sets from hand)
+            hand_actions = self.hand_play_gen.generate_hand_plays(hand, table)
+            actions.extend(hand_actions)
             
-            for tile_combo in combinations(hand_tiles, size):
-                tried += 1
-                if tried > max_combinations:
-                    break
+            # Generator 2: Table extensions (add to existing sets)
+            if len(table) > 0:
+                ext_actions = self.table_ext_gen.generate(hand, table)
+                actions.extend(ext_actions)
+            
+            # Generator 3: Complex rearrangements (windowed search)
+            if len(table) > 0 and self.rearrange_gen is not None:
+                rearrange_actions = self.rearrange_gen.generate(hand, table)
+                actions.extend(rearrange_actions)
+        
+        # Remove duplicates
+        actions = self._deduplicate_actions(actions)
+        
+        return actions
+    
+    def _deduplicate_actions(self, actions: List) -> List:
+        """Remove duplicate actions based on tiles played and result."""
+        seen = set()
+        unique = []
+        
+        for action in actions:
+            if action.action_type == 'draw':
+                if 'draw' not in seen:
+                    unique.append(action)
+                    seen.add('draw')
+                continue
+            
+            # Signature: tiles used + resulting table configuration
+            tile_sig = tuple(sorted(t.tile_id for t in action.tiles)) if action.tiles else ()
+            
+            if action.table_config:
+                table_sig = []
+                for ts in action.table_config:
+                    set_tiles = tuple(sorted(t.tile_id for t in ts.tiles))
+                    table_sig.append((ts.set_type, set_tiles))
+                table_sig = tuple(sorted(table_sig))
+            else:
+                table_sig = ()
+            
+            signature = (action.action_type, tile_sig, table_sig)
+            
+            if signature not in seen:
+                unique.append(action)
+                seen.add(signature)
+        
+        return unique
+
+
+# =============================================================================
+# GENERATOR 1: Simple Hand Plays (No Table Manipulation)
+# =============================================================================
+
+class HandPlayGenerator:
+    """
+    Generator 1: Find valid runs and groups from hand tiles only.
+    
+    Example:
+        hand = {R11, b11, B11, O11, b13, B13, O13}
+        
+        Generates:
+        1. {{R11, b11, B11}}
+        2. {{R11, b11, B11, O11}}
+        3. {{b13, B13, O13}}
+        4. {{R11, b11, B11}, {b13, B13, O13}}
+        5. {{R11, b11, B11, O11}, {b13, B13, O13}}
+        ... etc
+    """
+    
+    def generate_initial_melds(self, hand: List) -> List:
+        """
+        Generate initial melds (30+ points, from hand only).
+        Used before ice-breaking.
+        """
+        from Rummikub_env import RummikubAction
+        
+        actions = []
+        
+        # Try all subsets of hand (largest first for efficiency)
+        for size in range(len(hand), 2, -1):
+            for tile_combo in combinations(hand, size):
+                tiles = list(tile_combo)
                 
-                tile_list = list(tile_combo)
-                partitions = self._find_all_valid_partitions(tile_list)
+                # Find all valid partitions
+                partitions = self._find_valid_partitions(tiles)
                 
                 for partition in partitions:
+                    # Check if meld value >= 30
                     total_value = sum(s.get_meld_value() for s in partition)
                     
                     if total_value >= 30:
                         tiles_used = []
-                        for tile_set in partition:
-                            tiles_used.extend(tile_set.tiles)
+                        for ts in partition:
+                            tiles_used.extend(ts.tiles)
                         
                         action = RummikubAction(
                             action_type='initial_meld',
                             tiles=tiles_used,
                             sets=partition,
-                            table_config=partition
+                            table_config=partition  # New sets become table
                         )
-                        legal_actions.append(action)
-                        self.stats['heuristic_actions'] += 1
-                        
-                        # Stop if found enough
-                        if len(legal_actions) >= max_actions:
-                            return legal_actions
+                        actions.append(action)
         
-        return legal_actions
+        return actions
     
-    # =========================================================================
-    # MODE 1: HEURISTIC ONLY
-    # =========================================================================
-    
-    def _generate_heuristic_actions(self, hand_tiles: List, table_sets: List) -> List:
-        """Generate actions using only fast heuristics."""
-        legal_actions = []
-        
-        legal_actions.extend(self._generate_hand_only_actions(hand_tiles, table_sets))
-        legal_actions.extend(self._generate_single_tile_additions(hand_tiles, table_sets))
-        legal_actions.extend(self._generate_multi_tile_additions(hand_tiles, table_sets))
-        
-        return legal_actions
-    
-    # =========================================================================
-    # MODE 2: HYBRID
-    # =========================================================================
-    
-    def _generate_hybrid_actions(self, hand_tiles: List, table_sets: List) -> List:
-        """Generate actions using heuristics + ILP for complex cases."""
-        legal_actions = []
-        
-        # Phase 1: Fast heuristics
-        legal_actions.extend(self._generate_heuristic_actions(hand_tiles, table_sets))
-        
-        # Phase 2: ILP for complex manipulations (if triggered)
-        if self._should_use_ilp(hand_tiles, table_sets):
-            ilp_actions = self._generate_ilp_manipulations(hand_tiles, table_sets)
-            legal_actions.extend(ilp_actions)
-        
-        return legal_actions
-    
-    def _should_use_ilp(self, hand_tiles: List, table_sets: List) -> bool:
-        """Decide whether to use expensive ILP solver."""
-        from Rummikub_env import TileType
-        
-        if len(hand_tiles) > 8:
-            return True
-        if len(table_sets) > 3:
-            return True
-        if any(t.tile_type == TileType.JOKER for t in hand_tiles):
-            return True
-        for tile_set in table_sets:
-            if tile_set.set_type == 'run' and len(tile_set.tiles) >= 5:
-                return True
-        
-        return False
-    
-    # =========================================================================
-    # MODE 3: ILP ONLY
-    # =========================================================================
-    
-    def _generate_ilp_only_actions(self, hand_tiles: List, table_sets: List) -> List:
-        """Generate actions using ONLY ILP solver."""
-        legal_actions = []
-        
-        # Try all subsets of hand
-        hand_subsets = self._generate_all_hand_subsets(hand_tiles, max_size=10)
-        
-        ilp_call_count = 0
-        for hand_subset in hand_subsets:
-            if ilp_call_count >= self.max_ilp_calls:
-                break
-            
-            result = self._solve_ilp_complete(hand_subset, table_sets)
-            
-            if result is not None:
-                legal_actions.append(result)
-                self.stats['ilp_actions'] += 1
-            
-            ilp_call_count += 1
-        
-        return legal_actions
-    
-    def _generate_all_hand_subsets(self, hand_tiles: List, max_size: int = 10) -> List[List]:
-        """Generate all subsets of hand tiles up to max_size."""
-        subsets = [[]]  # Empty subset
-        
-        for size in range(1, min(len(hand_tiles) + 1, max_size + 1)):
-            for combo in combinations(hand_tiles, size):
-                subsets.append(list(combo))
-        
-        return subsets
-    
-    # =========================================================================
-    # COMPLETE ILP SOLVER (✅ TODO FINISHED)
-    # =========================================================================
-    
-    def _solve_ilp_complete(self, hand_subset: List, table_sets: List) -> Optional:
+    def generate_hand_plays(self, hand: List, table: List) -> List:
         """
-        ✅ COMPLETE ILP SOLVER IMPLEMENTATION
-        
-        This is the full ILP solver from the paper using OR-Tools.
-        All TODOs are implemented.
+        Generate play actions from hand only (after ice-breaking).
         """
-        from Rummikub_env import RummikubAction, TileType, TileSet
-        
-        if not HAS_ORTOOLS or len(hand_subset) == 0:
-            return None
-        
-        start_time = time.time()
-        
-        # Create solver
-        solver = pywraplp.Solver.CreateSolver('SCIP')
-        if not solver:
-            return None
-        
-        solver.SetTimeLimit(int(self.ilp_time_limit * 1000))
-        
-        # ====================================================================
-        # Build tile inventory
-        # ====================================================================
-        tile_inventory = {}  # tile_id -> [on_table_count, in_hand_count]
-        
-        for tile_set in table_sets:
-            for tile in tile_set.tiles:
-                if tile.tile_id not in tile_inventory:
-                    tile_inventory[tile.tile_id] = [0, 0]
-                tile_inventory[tile.tile_id][0] += 1
-        
-        for tile in hand_subset:
-            if tile.tile_id not in tile_inventory:
-                tile_inventory[tile.tile_id] = [0, 0]
-            tile_inventory[tile.tile_id][1] += 1
-        
-        # ====================================================================
-        # Create variables
-        # ====================================================================
-        x_vars = {}  # x_j: how many times set j appears
-        for j in range(len(self.all_possible_sets)):
-            x_vars[j] = solver.IntVar(0, 2, f'x_{j}')
-        
-        y_vars = {}  # y_i: how many tiles played from hand
-        for tile_id in tile_inventory.keys():
-            max_can_play = tile_inventory[tile_id][1]
-            y_vars[tile_id] = solver.IntVar(0, max_can_play, f'y_{tile_id}')
-        
-        # ====================================================================
-        # Build constraint matrix s_ij
-        # ====================================================================
-        all_tiles_dict = self._build_tile_dict(tile_inventory.keys())
-        s_matrix = {}
-        
-        for tile_id in tile_inventory.keys():
-            s_matrix[tile_id] = {}
-            for j, set_template in enumerate(self.all_possible_sets):
-                count = self._count_tile_in_template(tile_id, set_template, all_tiles_dict)
-                if count > 0:
-                    s_matrix[tile_id][j] = count
-        
-        # ====================================================================
-        # Add constraints: sum(s_ij * x_j) = t_i + y_i
-        # ====================================================================
-        for tile_id in tile_inventory.keys():
-            t_i = tile_inventory[tile_id][0]
-            
-            # Create constraint: sum(s_ij * x_j) - y_i = t_i
-            constraint = solver.Constraint(t_i, t_i, f'tile_{tile_id}')
-            
-            for j in range(len(self.all_possible_sets)):
-                if tile_id in s_matrix and j in s_matrix[tile_id]:
-                    coefficient = s_matrix[tile_id][j]
-                    constraint.SetCoefficient(x_vars[j], coefficient)
-            
-            constraint.SetCoefficient(y_vars[tile_id], -1)
-        
-        # ====================================================================
-        # Set objective: maximize sum of tile values played
-        # ====================================================================
-        objective = solver.Objective()
-        
-        for tile_id, var in y_vars.items():
-            tile = all_tiles_dict.get(tile_id)
-            if tile:
-                value = tile.number if tile.tile_type != TileType.JOKER else 30
-                objective.SetCoefficient(var, value)
-        
-        objective.SetMaximization()
-        
-        # ====================================================================
-        # Solve
-        # ====================================================================
-        status = solver.Solve()
-        
-        elapsed_time = time.time() - start_time
-        self.stats['ilp_time_total'] += elapsed_time
-        
-        if status not in [pywraplp.Solver.OPTIMAL, pywraplp.Solver.FEASIBLE]:
-            return None
-        
-        # ====================================================================
-        # Extract solution
-        # ====================================================================
-        tiles_played = sum(y_vars[tid].solution_value() for tid in tile_inventory.keys())
-        
-        if tiles_played == 0:
-            return None
-        
-        # Build new table configuration
-        new_table_config = []
-        used_tiles = set()
-        
-        for j, var in x_vars.items():
-            count = int(var.solution_value())
-            if count > 0:
-                set_template = self.all_possible_sets[j]
-                
-                # Instantiate this set 'count' times
-                for _ in range(count):
-                    tile_set = self._instantiate_set(set_template, all_tiles_dict, used_tiles)
-                    if tile_set:
-                        new_table_config.append(tile_set)
-                        for tile in tile_set.tiles:
-                            used_tiles.add(tile.tile_id)
-        
-        # Verify solution
-        if not new_table_config or not self._verify_solution(new_table_config, hand_subset, table_sets):
-            return None
-        
-        action = RummikubAction(
-            action_type='play',
-            tiles=hand_subset,
-            sets=new_table_config,
-            table_config=new_table_config
-        )
-        
-        return action
-    
-    def _solve_ilp_feasibility(self, hand_subset: List, table_sets: List) -> Optional:
-        """
-        ✅ ILP feasibility check (used by hybrid mode).
-        Calls the complete ILP solver.
-        """
-        return self._solve_ilp_complete(hand_subset, table_sets)
-    
-    def _generate_ilp_manipulations(self, hand_tiles: List, table_sets: List) -> List:
-        """Generate actions using ILP for complex manipulations."""
-        legal_actions = []
-        
-        promising_subsets = self._identify_promising_subsets(hand_tiles, table_sets)
-        
-        ilp_call_count = 0
-        for hand_subset in promising_subsets:
-            if ilp_call_count >= self.max_ilp_calls:
-                break
-            
-            result = self._solve_ilp_feasibility(hand_subset, table_sets)
-            
-            if result is not None:
-                legal_actions.append(result)
-                self.stats['ilp_actions'] += 1
-            
-            ilp_call_count += 1
-        
-        return legal_actions
-    
-    # =========================================================================
-    # ILP HELPER METHODS (✅ ALL IMPLEMENTED)
-    # =========================================================================
-    
-    def _build_tile_dict(self, tile_ids: Set[int]) -> Dict:
-        """Build dictionary of tile_id -> Tile object."""
-        tile_dict = {}
-        
-        for tile in self.current_hand:
-            if tile.tile_id in tile_ids:
-                tile_dict[tile.tile_id] = tile
-        
-        for tile_set in self.current_table:
-            for tile in tile_set.tiles:
-                if tile.tile_id in tile_ids:
-                    tile_dict[tile.tile_id] = tile
-        
-        return tile_dict
-    
-    def _count_tile_in_template(self, tile_id: int, set_template: SetTemplate, 
-                               all_tiles_dict: Dict) -> int:
-        """✅ Count how many times tile appears in template."""
-        from Rummikub_env import TileType
-        
-        tile = all_tiles_dict.get(tile_id)
-        if not tile:
-            return 0
-        
-        count = 0
-        
-        for pattern_pos in set_template.pattern:
-            if pattern_pos == ('JOKER', 'JOKER'):
-                if tile.tile_type == TileType.JOKER:
-                    count += 1
-            else:
-                pattern_color, pattern_number = pattern_pos
-                if (tile.tile_type != TileType.JOKER and
-                    tile.color.value == pattern_color and
-                    tile.number == pattern_number):
-                    count += 1
-        
-        return count
-    
-    def _instantiate_set(self, set_template: SetTemplate, all_tiles_dict: Dict,
-                        used_tiles: Set[int]) -> Optional:
-        """✅ Convert abstract set template to actual TileSet."""
-        from Rummikub_env import TileSet, TileType
-        
-        # Find tiles matching pattern (not already used)
-        available_tiles = [t for tid, t in all_tiles_dict.items() if tid not in used_tiles]
-        
-        if len(available_tiles) < len(set_template.pattern):
-            return None
-        
-        # Try to match tiles to pattern
-        selected_tiles = []
-        temp_used = set()
-        
-        for pattern_pos in set_template.pattern:
-            found = False
-            
-            for tile in available_tiles:
-                if tile.tile_id in temp_used:
-                    continue
-                
-                if pattern_pos == ('JOKER', 'JOKER'):
-                    if tile.tile_type == TileType.JOKER:
-                        selected_tiles.append(tile)
-                        temp_used.add(tile.tile_id)
-                        found = True
-                        break
-                else:
-                    pattern_color, pattern_number = pattern_pos
-                    if (tile.tile_type != TileType.JOKER and
-                        tile.color.value == pattern_color and
-                        tile.number == pattern_number):
-                        selected_tiles.append(tile)
-                        temp_used.add(tile.tile_id)
-                        found = True
-                        break
-            
-            if not found:
-                return None
-        
-        tile_set = TileSet(tiles=selected_tiles, set_type=set_template.set_type)
-        return tile_set if tile_set.is_valid() else None
-    
-    def _verify_solution(self, new_table: List, hand_subset: List, old_table: List) -> bool:
-        """Verify ILP solution is valid."""
-        from Rummikub_env import TileSet
-        
-        if not all(isinstance(s, TileSet) and s.is_valid() for s in new_table):
-            return False
-        
-        # Check tile accounting
-        old_tiles = set()
-        for tile_set in old_table:
-            for tile in tile_set.tiles:
-                old_tiles.add(tile.tile_id)
-        
-        new_tiles = set()
-        for tile_set in new_table:
-            for tile in tile_set.tiles:
-                new_tiles.add(tile.tile_id)
-        
-        hand_tile_ids = set(t.tile_id for t in hand_subset)
-        expected = old_tiles | hand_tile_ids
-        
-        return new_tiles == expected
-    
-    # =========================================================================
-    # TEMPLATE GENERATION (✅ ALL 1174 TEMPLATES)
-    # =========================================================================
-    
-    def _generate_all_set_templates(self) -> List[SetTemplate]:
-        """✅ Generate all 1174 possible valid set templates."""
-        templates = []
-        template_id = 0
-        
-        # RUNS WITHOUT JOKERS (120 total: 4 colors × 30 runs)
-        for color in range(4):
-            for start in range(1, 12):  # Length 3: 11 runs
-                pattern = [(color, start+i) for i in range(3)]
-                templates.append(SetTemplate('run', pattern, 0, template_id))
-                template_id += 1
-            
-            for start in range(1, 11):  # Length 4: 10 runs
-                pattern = [(color, start+i) for i in range(4)]
-                templates.append(SetTemplate('run', pattern, 0, template_id))
-                template_id += 1
-            
-            for start in range(1, 10):  # Length 5: 9 runs
-                pattern = [(color, start+i) for i in range(5)]
-                templates.append(SetTemplate('run', pattern, 0, template_id))
-                template_id += 1
-        
-        # RUNS WITH 1 JOKER (simplified version - add more positions for complete 494)
-        for color in range(4):
-            for start in range(1, 12):
-                # Joker at each position in length-3 run
-                for joker_pos in range(3):
-                    pattern = []
-                    for i in range(3):
-                        if i == joker_pos:
-                            pattern.append(('JOKER', 'JOKER'))
-                        else:
-                            offset = i if i < joker_pos else i - 1
-                            pattern.append((color, start + offset))
-                    templates.append(SetTemplate('run', pattern, 1, template_id))
-                    template_id += 1
-        
-        # GROUPS WITHOUT JOKERS (65 total: 13 numbers × 5 combinations)
-        for number in range(1, 14):
-            for color_combo in combinations(range(4), 3):
-                pattern = [(color, number) for color in color_combo]
-                templates.append(SetTemplate('group', pattern, 0, template_id))
-                template_id += 1
-            
-            pattern = [(color, number) for color in range(4)]
-            templates.append(SetTemplate('group', pattern, 0, template_id))
-            template_id += 1
-        
-        # GROUPS WITH 1 JOKER (130 total: 13 numbers × 10 combinations)
-        for number in range(1, 14):
-            for color_combo in combinations(range(4), 2):
-                pattern = [(color, number) for color in color_combo] + [('JOKER', 'JOKER')]
-                templates.append(SetTemplate('group', pattern, 1, template_id))
-                template_id += 1
-            
-            for color_combo in combinations(range(4), 3):
-                pattern = [(color, number) for color in color_combo] + [('JOKER', 'JOKER')]
-                templates.append(SetTemplate('group', pattern, 1, template_id))
-                template_id += 1
-        
-        # GROUPS WITH 2 JOKERS (78 total: 13 numbers × 6 combinations)
-        for number in range(1, 14):
-            for color_combo in combinations(range(4), 2):
-                pattern = [(color, number) for color in color_combo] + \
-                         [('JOKER', 'JOKER'), ('JOKER', 'JOKER')]
-                templates.append(SetTemplate('group', pattern, 2, template_id))
-                template_id += 1
-        
-        # Note: This is a simplified version with ~500 templates
-        # Full 1174 would need all run positions with jokers
-        
-        return templates
-    
-    # =========================================================================
-    # HEURISTIC METHODS
-    # =========================================================================
-    
-    def _generate_hand_only_actions(self, hand_tiles: List, table_sets: List) -> List:
-        """Generate actions playing sets from hand only."""
         from Rummikub_env import RummikubAction
         
-        legal_actions = []
+        if len(hand) < 3:
+            return []
         
-        for size in range(3, len(hand_tiles) + 1):
-            for tile_combo in combinations(hand_tiles, size):
-                tile_list = list(tile_combo)
-                partitions = self._find_all_valid_partitions(tile_list)
+        actions = []
+        
+        # Try all subsets of hand (size 3+)
+        for size in range(3, len(hand) + 1):
+            for tile_combo in combinations(hand, size):
+                tiles = list(tile_combo)
+                
+                # Find all valid partitions
+                partitions = self._find_valid_partitions(tiles)
                 
                 for partition in partitions:
                     tiles_used = []
-                    for tile_set in partition:
-                        tiles_used.extend(tile_set.tiles)
+                    for ts in partition:
+                        tiles_used.extend(ts.tiles)
                     
-                    new_table = copy.deepcopy(table_sets) + partition
+                    # New table = old table + new sets
+                    new_table = copy.deepcopy(table)
+                    new_table.extend(partition)
                     
                     action = RummikubAction(
                         action_type='play',
@@ -651,435 +298,563 @@ class ActionGenerator:
                         sets=partition,
                         table_config=new_table
                     )
-                    legal_actions.append(action)
-                    self.stats['heuristic_actions'] += 1
+                    actions.append(action)
         
-        return legal_actions
+        return actions
     
-    def _generate_single_tile_additions(self, hand_tiles: List, table_sets: List) -> List:
-        """Add single tile from hand to table set."""
-        from Rummikub_env import RummikubAction, TileSet
-        
-        legal_actions = []
-        
-        for tile in hand_tiles:
-            for set_idx, table_set in enumerate(table_sets):
-                for insert_pos in range(len(table_set.tiles) + 1):
-                    new_tiles = table_set.tiles[:insert_pos] + [tile] + table_set.tiles[insert_pos:]
-                    
-                    for set_type in ['run', 'group']:
-                        test_set = TileSet(tiles=new_tiles, set_type=set_type)
-                        if test_set.is_valid():
-                            new_table = copy.deepcopy(table_sets)
-                            new_table[set_idx] = test_set
-                            
-                            action = RummikubAction(
-                                action_type='play',
-                                tiles=[tile],
-                                sets=[test_set],
-                                table_config=new_table
-                            )
-                            legal_actions.append(action)
-                            self.stats['heuristic_actions'] += 1
-        
-        return legal_actions
-    
-    def _generate_multi_tile_additions(self, hand_tiles: List, table_sets: List) -> List:
-        """Add multiple tiles from hand to one table set."""
-        from Rummikub_env import RummikubAction, TileSet
-        
-        legal_actions = []
-        
-        for size in range(2, min(4, len(hand_tiles) + 1)):
-            for tile_combo in combinations(hand_tiles, size):
-                hand_subset = list(tile_combo)
-                
-                for set_idx, table_set in enumerate(table_sets):
-                    combined_tiles = table_set.tiles + hand_subset
-                    
-                    for set_type in ['run', 'group']:
-                        test_set = TileSet(tiles=combined_tiles, set_type=set_type)
-                        if test_set.is_valid():
-                            new_table = copy.deepcopy(table_sets)
-                            new_table[set_idx] = test_set
-                            
-                            action = RummikubAction(
-                                action_type='play',
-                                tiles=hand_subset,
-                                sets=[test_set],
-                                table_config=new_table
-                            )
-                            legal_actions.append(action)
-                            self.stats['heuristic_actions'] += 1
-        
-        return legal_actions
-    
-    def _identify_promising_subsets(self, hand_tiles: List, table_sets: List) -> List[List]:
-        """Generate promising hand subsets for ILP."""
-        from Rummikub_env import TileType
-        from collections import defaultdict
-        
-        promising = []
-        
-        # Get table info
-        table_colors = set()
-        table_numbers = set()
-        for tile_set in table_sets:
-            for tile in tile_set.tiles:
-                if tile.tile_type != TileType.JOKER:
-                    table_colors.add(tile.color)
-                    table_numbers.add(tile.number)
-        
-        # Strategy 1: Tiles matching table colors/numbers
-        matching_tiles = [t for t in hand_tiles 
-                        if t.tile_type == TileType.JOKER or 
-                        t.color in table_colors or 
-                        t.number in table_numbers]
-        
-        if len(matching_tiles) >= 2:
-            for size in range(2, min(6, len(matching_tiles) + 1)):
-                for combo in combinations(matching_tiles, size):
-                    promising.append(list(combo))
-        
-        # Strategy 2: Consecutive numbers (potential runs)
-        for color in set(t.color for t in hand_tiles if t.tile_type != TileType.JOKER):
-            same_color = [t for t in hand_tiles if t.tile_type != TileType.JOKER and t.color == color]
-            if len(same_color) >= 2:
-                same_color.sort(key=lambda t: t.number)
-                # Find consecutive sequences
-                for i in range(len(same_color) - 1):
-                    for j in range(i + 1, min(i + 5, len(same_color))):
-                        promising.append(same_color[i:j+1])
-        
-        # Strategy 3: Same numbers (potential groups)
-        by_number = defaultdict(list)
-        for tile in hand_tiles:
-            if tile.tile_type != TileType.JOKER:
-                by_number[tile.number].append(tile)
-        
-        for number, tiles in by_number.items():
-            if len(tiles) >= 2:
-                for size in range(2, min(4, len(tiles) + 1)):
-                    for combo in combinations(tiles, size):
-                        promising.append(list(combo))
-        
-        # Strategy 4: Include jokers with other subsets
-        jokers = [t for t in hand_tiles if t.tile_type == TileType.JOKER]
-        if jokers:
-            # Add joker to some promising subsets
-            extended = []
-            for subset in promising[:20]:  # Limit to avoid explosion
-                for joker in jokers:
-                    extended.append(subset + [joker])
-            promising.extend(extended)
-        
-        # Remove duplicates and limit size
-        unique_promising = []
-        seen = set()
-        for subset in promising:
-            key = tuple(sorted(t.tile_id for t in subset))
-            if key not in seen:
-                seen.add(key)
-                unique_promising.append(subset)
-        
-        return unique_promising[:100]  # Limit total
-
-
-    def _find_all_valid_partitions(self, tiles: List) -> List[List]:
+    def _find_valid_partitions(self, tiles: List) -> List[List]:
         """
-        Find all ways to partition tiles into valid sets.
-        
-        This is a recursive backtracking problem.
-        Returns list of partitions, where each partition is list of TileSets.
+        Find all valid ways to partition tiles into runs and groups.
+        Uses backtracking search.
         """
         from Rummikub_env import TileSet
         
         if len(tiles) < 3:
             return []
         
-        valid_partitions = []
+        partitions = []
         
-        # Try to form sets of size 3, 4, 5, etc.
-        for set_size in range(3, min(len(tiles) + 1, 14)):
-            for tile_combo in combinations(tiles, set_size):
-                tile_list = list(tile_combo)
-                
-                # Try as run
-                test_run = TileSet(tiles=tile_list, set_type='run')
-                if test_run.is_valid():
-                    remaining = [t for t in tiles if t not in tile_combo]
+        def backtrack(remaining: List, current_partition: List):
+            if len(remaining) == 0:
+                # Found valid complete partition
+                if len(current_partition) > 0:
+                    partitions.append(copy.deepcopy(current_partition))
+                return
+            
+            if len(remaining) < 3:
+                # Can't form more sets
+                return
+            
+            # Try all possible sets from remaining tiles
+            for size in range(3, min(len(remaining) + 1, 14)):  # Max 13 for runs
+                for combo in combinations(remaining, size):
+                    tile_list = list(combo)
                     
-                    if len(remaining) == 0:
-                        # All tiles used
-                        valid_partitions.append([test_run])
-                    elif len(remaining) >= 3:
-                        # Recursively partition remaining
-                        sub_partitions = self._find_all_valid_partitions(remaining)
-                        for sub in sub_partitions:
-                            valid_partitions.append([test_run] + sub)
-                
-                # Try as group
-                test_group = TileSet(tiles=tile_list, set_type='group')
-                if test_group.is_valid():
-                    remaining = [t for t in tiles if t not in tile_combo]
+                    # Try as run
+                    test_run = TileSet(tiles=tile_list, set_type='run')
+                    if test_run.is_valid():
+                        new_remaining = [t for t in remaining if t not in combo]
+                        current_partition.append(test_run)
+                        backtrack(new_remaining, current_partition)
+                        current_partition.pop()
                     
-                    if len(remaining) == 0:
-                        # All tiles used
-                        valid_partitions.append([test_group])
-                    elif len(remaining) >= 3:
-                        # Recursively partition remaining
-                        sub_partitions = self._find_all_valid_partitions(remaining)
-                        for sub in sub_partitions:
-                            valid_partitions.append([test_group] + sub)
+                    # Try as group (max 4 tiles)
+                    if size <= 4:
+                        test_group = TileSet(tiles=tile_list, set_type='group')
+                        if test_group.is_valid():
+                            new_remaining = [t for t in remaining if t not in combo]
+                            current_partition.append(test_group)
+                            backtrack(new_remaining, current_partition)
+                            current_partition.pop()
         
-        return valid_partitions
+        backtrack(tiles, [])
+        return partitions
 
 
-    def get_stats(self) -> Dict:
-        """Return statistics about action generation."""
-        return self.stats.copy()
+# =============================================================================
+# GENERATOR 2: Table Extensions (Add to Existing Sets)
+# =============================================================================
+
+class TableExtensionGenerator:
+    """
+    Generator 2: Add tiles from hand to existing table sets.
     
-    def _identify_promising_subsets(self, hand_tiles: List, table_sets: List) -> List[List]:
-        """Generate promising hand subsets for ILP."""
+    Example:
+        hand = {R1, R6, R8, R8, R11, R12, b1, b3, b9, b10, b11, b13, ...}
+        table = {{R1, B1, O1}, {R9, R10, R11}}
+        
+        Generates:
+        1. Play b1 to {R1, B1, O1} => {b1, R1, B1, O1}
+        2. Play R8 to {R9, R10, R11} => {R8, R9, R10, R11}
+        3. Play R12 to {R9, R10, R11} => {R9, R10, R11, R12}
+        4. Combo: b1 to set1 AND R8 to set2
+        5. Combo: b1 to set1 AND R12 to set2
+        6. Combo: b1 to set1 AND R8, R12 to set2 => {R8, R9, R10, R11, R12}
+        ... etc
+    """
+    
+    def generate(self, hand: List, table: List) -> List:
+        """Generate all table extension actions."""
+        from Rummikub_env import RummikubAction
+        
+        if len(table) == 0 or len(hand) == 0:
+            return []
+        
+        actions = []
+        
+        # Find all possible extensions for each table set
+        extensions_per_set = []
+        
+        for set_idx, table_set in enumerate(table):
+            extensions = self._find_extensions(table_set, hand)
+            
+            if len(extensions) > 0:
+                extensions_per_set.append((set_idx, extensions))
+        
+        if len(extensions_per_set) == 0:
+            return []
+        
+        # Generate all combinations of extensions
+        combinations_list = self._generate_combos(extensions_per_set)
+        
+        for combo in combinations_list:
+            # combo is list of (set_idx, tiles_to_add, new_set)
+            tiles_used = []
+            new_table = copy.deepcopy(table)
+            
+            for set_idx, tiles_to_add, new_set in combo:
+                tiles_used.extend(tiles_to_add)
+                new_table[set_idx] = new_set
+            
+            action = RummikubAction(
+                action_type='play',
+                tiles=tiles_used,
+                sets=None,  # Extensions modify existing sets
+                table_config=new_table
+            )
+            actions.append(action)
+        
+        return actions
+    
+    def _find_extensions(self, table_set, hand: List) -> List[Tuple]:
+        """Find all ways to extend a single table set."""
+        if table_set.set_type == 'run':
+            return self._extend_run(table_set, hand)
+        elif table_set.set_type == 'group':
+            return self._extend_group(table_set, hand)
+        return []
+    
+    def _extend_run(self, run, hand: List) -> List[Tuple]:
+        """Find ways to extend a run by adding consecutive tiles."""
+        from Rummikub_env import TileSet, TileType
+        
+        extensions = []
+        
+        # Get run color and number range
+        non_jokers = [t for t in run.tiles if t.tile_type != TileType.JOKER]
+        if len(non_jokers) == 0:
+            return []
+        
+        run_color = non_jokers[0].color
+        numbers = sorted([t.number for t in non_jokers])
+        min_num = numbers[0]
+        max_num = numbers[-1]
+        
+        # Find matching tiles in hand
+        matching = [t for t in hand 
+                   if t.tile_type != TileType.JOKER and t.color == run_color]
+        
+        # Single tile extensions
+        for tile in matching:
+            # Add to beginning
+            if tile.number == min_num - 1 and tile.number >= 1:
+                new_tiles = [tile] + run.tiles
+                new_set = TileSet(tiles=new_tiles, set_type='run')
+                if new_set.is_valid():
+                    extensions.append(([tile], new_set))
+            
+            # Add to end
+            if tile.number == max_num + 1 and tile.number <= 13:
+                new_tiles = run.tiles + [tile]
+                new_set = TileSet(tiles=new_tiles, set_type='run')
+                if new_set.is_valid():
+                    extensions.append(([tile], new_set))
+        
+        # Two tile extensions (both ends)
+        for tile1 in matching:
+            for tile2 in matching:
+                if tile1.tile_id != tile2.tile_id:
+                    if (tile1.number == min_num - 1 and 
+                        tile2.number == max_num + 1 and
+                        tile1.number >= 1 and tile2.number <= 13):
+                        new_tiles = [tile1] + run.tiles + [tile2]
+                        new_set = TileSet(tiles=new_tiles, set_type='run')
+                        if new_set.is_valid():
+                            extensions.append(([tile1, tile2], new_set))
+        
+        # Multiple consecutive tiles at one end
+        for num_tiles in range(2, 4):  # Try 2-3 tiles
+            for combo in combinations(matching, num_tiles):
+                tiles = list(combo)
+                tile_numbers = [t.number for t in tiles]
+                
+                # Check if consecutive
+                tile_numbers.sort()
+                is_consecutive = all(
+                    tile_numbers[i+1] - tile_numbers[i] == 1 
+                    for i in range(len(tile_numbers) - 1)
+                )
+                
+                if not is_consecutive:
+                    continue
+                
+                # Try adding to beginning
+                if tile_numbers[-1] == min_num - 1:
+                    tiles_sorted = sorted(tiles, key=lambda t: t.number)
+                    new_tiles = tiles_sorted + run.tiles
+                    new_set = TileSet(tiles=new_tiles, set_type='run')
+                    if new_set.is_valid():
+                        extensions.append((tiles, new_set))
+                
+                # Try adding to end
+                if tile_numbers[0] == max_num + 1:
+                    tiles_sorted = sorted(tiles, key=lambda t: t.number)
+                    new_tiles = run.tiles + tiles_sorted
+                    new_set = TileSet(tiles=new_tiles, set_type='run')
+                    if new_set.is_valid():
+                        extensions.append((tiles, new_set))
+        
+        return extensions
+    
+    def _extend_group(self, group, hand: List) -> List[Tuple]:
+        """Find ways to extend a group by adding same number, different color."""
+        from Rummikub_env import TileSet, TileType
+        
+        extensions = []
+        
+        # Get group number and used colors
+        non_jokers = [t for t in group.tiles if t.tile_type != TileType.JOKER]
+        if len(non_jokers) == 0:
+            return []
+        
+        group_number = non_jokers[0].number
+        used_colors = set(t.color for t in non_jokers)
+        
+        # Group already max size (4 tiles)
+        if len(group.tiles) >= 4:
+            return []
+        
+        # Find matching tiles in hand (same number, different color)
+        matching = [t for t in hand 
+                   if t.tile_type != TileType.JOKER 
+                   and t.number == group_number 
+                   and t.color not in used_colors]
+        
+        for tile in matching:
+            new_tiles = group.tiles + [tile]
+            new_set = TileSet(tiles=new_tiles, set_type='group')
+            if new_set.is_valid():
+                extensions.append(([tile], new_set))
+        
+        return extensions
+    
+    def _generate_combos(self, extensions_per_set: List) -> List:
+        """Generate all valid combinations of extensions."""
+        all_combos = []
+        
+        # Single extensions
+        for set_idx, extensions in extensions_per_set:
+            for tiles, new_set in extensions:
+                all_combos.append([(set_idx, tiles, new_set)])
+        
+        # Multiple extensions (ensure no tile overlap)
+        if len(extensions_per_set) >= 2:
+            for size in range(2, len(extensions_per_set) + 1):
+                for combo_indices in combinations(range(len(extensions_per_set)), size):
+                    # Get extension options for selected sets
+                    options = []
+                    for idx in combo_indices:
+                        set_idx, extensions = extensions_per_set[idx]
+                        options.append([(set_idx, tiles, new_set) 
+                                       for tiles, new_set in extensions])
+                    
+                    # Generate all combinations of extensions
+                    for ext_combo in product(*options):
+                        # Check for tile overlaps
+                        all_tile_ids = []
+                        for _, tiles, _ in ext_combo:
+                            all_tile_ids.extend([t.tile_id for t in tiles])
+                        
+                        # Valid if no duplicates
+                        if len(all_tile_ids) == len(set(all_tile_ids)):
+                            all_combos.append(list(ext_combo))
+        
+        return all_combos
+
+
+# =============================================================================
+# GENERATOR 3: Complex Rearrangements (Windowed Search)
+# =============================================================================
+
+class RearrangementGenerator:
+    """
+    Generator 3: Approximate full table rearrangement using windowed search.
+    
+    Strategy:
+    1. Select windows: Pick 1-2 table melds + limited hand subset
+    2. Filter tiles: Keep only tiles that "connect" to selected table sets
+    3. Backtracking search: Re-partition window tiles into valid melds
+    4. Limit: Top 10 melds per window for performance
+    
+    This approximates the true rearrangement problem while maintaining
+    reasonable performance.
+    """
+    
+    def __init__(self, max_windows: int = 30, max_melds_per_window: int = 10):
+        self.max_windows = max_windows
+        self.max_melds_per_window = max_melds_per_window
+    
+    def generate(self, hand: List, table: List) -> List:
+        """Generate rearrangement actions using windowed search."""
+        from Rummikub_env import RummikubAction
+        
+        if len(table) == 0:
+            return []
+        
+        actions = []
+        windows_explored = 0
+        
+        # Try single-set windows
+        for set_idx in range(len(table)):
+            if windows_explored >= self.max_windows:
+                break
+            
+            window_actions = self._explore_window([set_idx], hand, table)
+            actions.extend(window_actions)
+            windows_explored += 1
+        
+        # Try two-set windows
+        if windows_explored < self.max_windows and len(table) >= 2:
+            for idx1, idx2 in combinations(range(len(table)), 2):
+                if windows_explored >= self.max_windows:
+                    break
+                
+                window_actions = self._explore_window([idx1, idx2], hand, table)
+                actions.extend(window_actions)
+                windows_explored += 1
+        
+        return actions
+    
+    def _explore_window(self, table_indices: List[int], hand: List, 
+                       table: List) -> List:
+        """Explore a single window and generate actions."""
+        from Rummikub_env import RummikubAction, TileType
+        
+        actions = []
+        
+        # Get tiles from selected table sets
+        table_tiles = []
+        for idx in table_indices:
+            table_tiles.extend(table[idx].tiles)
+        
+        # Filter hand tiles that "connect" to table tiles
+        connected = self._filter_connected(hand, table_tiles)
+        
+        # Limit hand subset to keep search tractable
+        if len(connected) > 6:
+            # Prioritize: non-jokers, high value
+            connected.sort(key=lambda t: (
+                t.tile_type == TileType.JOKER,
+                -t.get_value()
+            ))
+            connected = connected[:6]
+        
+        if len(connected) == 0:
+            return []
+        
+        # Pool: table tiles + connected hand tiles
+        pool = table_tiles + connected
+        
+        # Find all valid re-partitions using backtracking
+        partitions = self._backtrack_search(pool)
+        
+        # Keep top N partitions by value played from hand
+        if len(partitions) > self.max_melds_per_window:
+            def score_partition(partition):
+                return sum(
+                    sum(t.get_value() for t in ts.tiles if t in connected)
+                    for ts in partition
+                )
+            partitions.sort(key=score_partition, reverse=True)
+            partitions = partitions[:self.max_melds_per_window]
+        
+        # Convert partitions to actions
+        for partition in partitions:
+            # Must use at least one hand tile
+            tiles_from_hand = [
+                t for ts in partition for t in ts.tiles 
+                if t in connected
+            ]
+            
+            if len(tiles_from_hand) == 0:
+                continue
+            
+            # Build new table: unchanged sets + new partition
+            new_table = []
+            for idx, ts in enumerate(table):
+                if idx not in table_indices:
+                    new_table.append(ts)
+            new_table.extend(partition)
+            
+            action = RummikubAction(
+                action_type='play',
+                tiles=tiles_from_hand,
+                sets=partition,
+                table_config=new_table
+            )
+            actions.append(action)
+        
+        return actions
+    
+    def _filter_connected(self, hand: List, table_tiles: List) -> List:
+        """
+        Filter hand tiles that 'connect' to table tiles.
+        
+        A tile connects if:
+        - Same number (group potential)
+        - Same color + adjacent number (run potential)
+        - Is a joker (universal)
+        """
         from Rummikub_env import TileType
-        from collections import defaultdict
         
-        promising = []
+        connected = []
         
-        # Get table info
-        table_colors = set()
+        # Extract table properties
         table_numbers = set()
-        for tile_set in table_sets:
-            for tile in tile_set.tiles:
-                if tile.tile_type != TileType.JOKER:
-                    table_colors.add(tile.color)
-
-
-    
-
-
-# ========================================================================
-# USAGE EXAMPLES
-# ========================================================================
-
-"""
-Example 1: Heuristic Only (Fastest)
-------------------------------------
-from complete_action_generator import ActionGenerator, SolverMode
-from Rummikub_env import RummikubEnv
-
-env = RummikubEnv(seed=42)
-generator = ActionGenerator(mode=SolverMode.HEURISTIC_ONLY)
-env.action_generator = generator
-
-state = env.reset()
-legal_actions = env.get_legal_actions(env.current_player)
-print(f"Found {len(legal_actions)} legal actions")
-
-
-Example 2: Hybrid (Recommended for RL)
----------------------------------------
-generator = ActionGenerator(
-    mode=SolverMode.HYBRID,
-    max_ilp_calls=50,  # Limit ILP usage
-    ilp_time_limit=1.0
-)
-env.action_generator = generator
-
-# Train your RL agent
-for episode in range(1000):
-    state = env.reset()
-    done = False
-    
-    while not done:
-        legal_actions = env.get_legal_actions(env.current_player)
-        action = your_agent.select_action(state, legal_actions)
-        state, reward, done, info = env.step(action)
-
-
-Example 3: ILP Only (Most Complete)
-------------------------------------
-generator = ActionGenerator(
-    mode=SolverMode.ILP_ONLY,
-    max_ilp_calls=100,
-    ilp_time_limit=2.0  # 2 seconds per solve
-)
-env.action_generator = generator
-
-# Use for analysis or as perfect opponent
-legal_actions = env.get_legal_actions(env.current_player)
-print(f"Found {len(legal_actions)} actions (complete search)")
-
-
-Example 4: Monitor Performance
--------------------------------
-generator = ActionGenerator(mode=SolverMode.HYBRID)
-env.action_generator = generator
-
-# Play some games
-for _ in range(10):
-    state = env.reset()
-    # ... play game ...
-
-# Check statistics
-stats = generator.get_stats()
-print(f"Total calls: {stats['total_calls']}")
-print(f"Heuristic actions found: {stats['heuristic_actions']}")
-print(f"ILP actions found: {stats['ilp_actions']}")
-print(f"Total ILP time: {stats['ilp_time_total']:.2f}s")
-
-avg_time = stats['ilp_time_total'] / max(stats['total_calls'], 1)
-print(f"Average time per call: {avg_time*1000:.1f}ms")
-
-
-Example 5: Switching Modes Dynamically
----------------------------------------
-# Start with fast mode for early training
-generator = ActionGenerator(mode=SolverMode.HEURISTIC_ONLY)
-env.action_generator = generator
-
-# Train for 10000 episodes
-train_agent(env, episodes=10000)
-
-# Switch to hybrid for better coverage
-generator = ActionGenerator(mode=SolverMode.HYBRID, max_ilp_calls=30)
-env.action_generator = generator
-
-# Fine-tune with more complete action space
-train_agent(env, episodes=5000)
-
-
-Example 6: Benchmark All Modes
--------------------------------
-import time
-
-def benchmark_mode(mode_name, mode, num_turns=100):
-    env = RummikubEnv(seed=42)
-    generator = ActionGenerator(mode=mode)
-    env.action_generator = generator
-    
-    state = env.reset()
-    start_time = time.time()
-    total_actions = 0
-    
-    for turn in range(num_turns):
-        legal_actions = env.get_legal_actions(env.current_player)
-        total_actions += len(legal_actions)
+        table_colors = set()
         
-        if not legal_actions:
-            break
+        for tile in table_tiles:
+            if tile.tile_type != TileType.JOKER:
+                table_numbers.add(tile.number)
+                table_colors.add(tile.color)
         
-        # Take random action
-        action = legal_actions[0]
-        state, reward, done, info = env.step(action)
+        # Check each hand tile
+        for tile in hand:
+            # Jokers connect to everything
+            if tile.tile_type == TileType.JOKER:
+                connected.append(tile)
+                continue
+            
+            # Same number => group potential
+            if tile.number in table_numbers:
+                connected.append(tile)
+                continue
+            
+            # Same color + nearby number => run potential
+            if tile.color in table_colors:
+                for num in table_numbers:
+                    if abs(tile.number - num) <= 2:
+                        connected.append(tile)
+                        break
         
-        if done:
-            state = env.reset()
+        return connected
     
-    elapsed = time.time() - start_time
-    
-    print(f"{mode_name}:")
-    print(f"  Total time: {elapsed:.2f}s")
-    print(f"  Time per turn: {elapsed/num_turns*1000:.1f}ms")
-    print(f"  Avg actions per turn: {total_actions/num_turns:.1f}")
-    print(f"  Actions per second: {total_actions/elapsed:.1f}")
-    print()
-
-# Run benchmarks
-print("Benchmarking action generators...\n")
-benchmark_mode("HEURISTIC_ONLY", SolverMode.HEURISTIC_ONLY)
-benchmark_mode("HYBRID", SolverMode.HYBRID)
-benchmark_mode("ILP_ONLY", SolverMode.ILP_ONLY)
-
-
-Example 7: Custom Tuning
--------------------------
-# Tune for your specific hardware/needs
-
-# Very fast (for rapid prototyping)
-fast_generator = ActionGenerator(
-    mode=SolverMode.HEURISTIC_ONLY
-)
-
-# Balanced (recommended)
-balanced_generator = ActionGenerator(
-    mode=SolverMode.HYBRID,
-    max_ilp_calls=30,
-    ilp_time_limit=0.5  # 500ms
-)
-
-# Thorough (for final training)
-thorough_generator = ActionGenerator(
-    mode=SolverMode.HYBRID,
-    max_ilp_calls=80,
-    ilp_time_limit=2.0
-)
-
-# Complete (for analysis)
-complete_generator = ActionGenerator(
-    mode=SolverMode.ILP_ONLY,
-    max_ilp_calls=200,
-    ilp_time_limit=5.0
-)
-"""
-
-
-# ========================================================================
-# TESTING & VALIDATION
-# ========================================================================
-
-def test_action_generator():
-    """Test all three modes to ensure they work correctly."""
-    from Rummikub_env import RummikubEnv
-    
-    print("Testing ActionGenerator...\n")
-    
-    for mode in [SolverMode.HEURISTIC_ONLY, SolverMode.HYBRID, SolverMode.ILP_ONLY]:
-        print(f"Testing {mode.value}...")
+    def _backtrack_search(self, pool: List) -> List[List]:
+        """Find valid partitions of pool using backtracking."""
+        from Rummikub_env import TileSet
         
-        try:
-            env = RummikubEnv(seed=42)
-            generator = ActionGenerator(mode=mode, max_ilp_calls=10)
-            env.action_generator = generator
-            
-            state = env.reset()
-            
-            for turn in range(5):
-                legal_actions = env.get_legal_actions(env.current_player)
-                
-                if len(legal_actions) == 0:
-                    print(f"  ❌ FAIL: No legal actions at turn {turn}")
-                    break
-                
-                # Verify all actions are valid
-                for action in legal_actions[:5]:  # Check first 5
-                    if action.action_type != 'draw':
-                        if action.sets:
-                            for tile_set in action.sets:
-                                if not tile_set.is_valid():
-                                    print(f"  ❌ FAIL: Invalid set found")
-                                    break
-                
-                # Take action
-                action = legal_actions[0]
-                state, reward, done, info = env.step(action)
-                
-                if done:
-                    break
-            
-            print(f"  ✅ {mode.value}: PASSED")
-            
-            # Show stats
-            stats = generator.get_stats()
-            print(f"     Actions: H={stats['heuristic_actions']}, ILP={stats['ilp_actions']}")
-            
-        except Exception as e:
-            print(f"  ❌ {mode.value}: FAILED with error: {e}")
+        if len(pool) < 3:
+            return []
         
-        print()
-    
-    print("Testing complete!")
+        partitions = []
+        max_partitions = self.max_melds_per_window * 2  # Find more, then filter
+        
+        def backtrack(remaining: List, current: List):
+            if len(partitions) >= max_partitions:
+                return
+            
+            if len(remaining) == 0:
+                if len(current) > 0:
+                    partitions.append(copy.deepcopy(current))
+                return
+            
+            if len(remaining) < 3:
+                return
+            
+            # Try forming sets greedily
+            for size in range(3, min(len(remaining) + 1, 14)):
+                for combo in combinations(remaining, size):
+                    tiles = list(combo)
+                    
+                    # Try as run
+                    test_run = TileSet(tiles=tiles, set_type='run')
+                    if test_run.is_valid():
+                        new_remaining = [t for t in remaining if t not in combo]
+                        current.append(test_run)
+                        backtrack(new_remaining, current)
+                        current.pop()
+                        
+                        if len(partitions) >= max_partitions:
+                            return
+                    
+                    # Try as group (max 4)
+                    if size <= 4:
+                        test_group = TileSet(tiles=tiles, set_type='group')
+                        if test_group.is_valid():
+                            new_remaining = [t for t in remaining if t not in combo]
+                            current.append(test_group)
+                            backtrack(new_remaining, current)
+                            current.pop()
+                            
+                            if len(partitions) >= max_partitions:
+                                return
+        
+        backtrack(pool, [])
+        return partitions
 
+
+# =============================================================================
+# TESTING AND EXAMPLES
+# =============================================================================
 
 if __name__ == "__main__":
-    test_action_generator()
+    print("="*70)
+    print("RUMMIKUB ACTION GENERATOR - TESTING")
+    print("="*70)
+    
+    from Rummikub_env import RummikubEnv
+    
+    # Create test environment
+    env = RummikubEnv(seed=42)
+    state = env.reset()
+    
+    # Test all modes
+    for mode in [SolverMode.HEURISTIC_ONLY, SolverMode.HYBRID]:
+        print(f"\n{'='*70}")
+        print(f"MODE: {mode.value.upper()}")
+        print(f"{'='*70}")
+        
+        gen = ActionGenerator(mode=mode, max_ilp_calls=10)
+        env.action_generator = gen
+        
+        # Test before ice-breaking
+        print("\n1. BEFORE ICE-BREAKING:")
+        hand = env.player_hands[0]
+        table = env.table
+        has_melded = env.has_melded[0]
+        
+        print(f"   Hand: {len(hand)} tiles, Value: {sum(t.get_value() for t in hand)}")
+        print(f"   Table: {len(table)} sets")
+        
+        actions = env.get_legal_actions(0)
+        print(f"   Actions: {len(actions)} total")
+        
+        action_types = {}
+        for action in actions:
+            action_types[action.action_type] = action_types.get(action.action_type, 0) + 1
+        for atype, count in action_types.items():
+            print(f"     - {atype}: {count}")
+        
+        # Make initial meld if possible
+        for action in actions:
+            if action.action_type == 'initial_meld':
+                env.step(action)
+                print(f"\n   ✓ Made initial meld: {len(action.tiles)} tiles")
+                break
+        
+        # Test after ice-breaking
+        if env.has_melded[0]:
+            print("\n2. AFTER ICE-BREAKING:")
+            env.current_player = 0
+            actions = env.get_legal_actions(0)
+            print(f"   Actions: {len(actions)} total")
+            
+            action_types = {}
+            for action in actions:
+                action_types[action.action_type] = action_types.get(action.action_type, 0) + 1
+            for atype, count in action_types.items():
+                print(f"     - {atype}: {count}")
+    
+    print(f"\n{'='*70}")
+    print("TESTING COMPLETE!")
+    print(f"{'='*70}\n")

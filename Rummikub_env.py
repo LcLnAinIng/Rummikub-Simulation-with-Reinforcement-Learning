@@ -33,7 +33,16 @@ class Tile:
     def __repr__(self):
         if self.tile_type == TileType.JOKER:
             return "JOKER"
-        return f"{self.color.name[0]}{self.number}"
+        # Use different cases to distinguish colors:
+        # BLUE = lowercase 'b', BLACK = uppercase 'B'
+        # RED = 'R', ORANGE = 'O'
+        color_map = {
+            Color.RED: 'R',
+            Color.BLUE: 'b',      # lowercase for BLUE
+            Color.BLACK: 'B',     # uppercase for BLACK
+            Color.ORANGE: 'O'
+        }
+        return f"{color_map[self.color]}{self.number}"
     
     def get_value(self) -> int:
         """Returns the point value of the tile"""
@@ -308,7 +317,7 @@ class RummikubEnv:
         """
         Get all legal actions for the current player.
         
-        This method should call your HybridActionGenerator.
+        TODO: This method should call your HybridActionGenerator.
         
         Instructions:
         1. Create an instance of HybridActionGenerator (see separate file)
@@ -349,6 +358,7 @@ class RummikubEnv:
     
     def _find_valid_initial_melds(self, player: int) -> List[RummikubAction]:
         """
+        TODO: This is a placeholder. Should be replaced by action generator.
         
         What you should do:
         - Remove this method entirely, OR
@@ -361,6 +371,7 @@ class RummikubEnv:
     
     def _find_valid_plays(self, player: int) -> List[RummikubAction]:
         """
+        TODO: This is a placeholder. Should be replaced by action generator.
         
         What you should do:
         - Remove this method entirely, OR  
@@ -413,7 +424,9 @@ class RummikubEnv:
                 self.player_hands[self.current_player].append(drawn_tile)
                 info['drew_tile'] = True
                 info['draw_penalty_applied'] = True
-                reward -= 5  # Drawing penalty
+            else:
+                # Invalid action - no tiles to draw
+                info['invalid_action'] = True
             
         elif action.action_type == 'initial_meld':
             # Player makes initial meld
@@ -422,7 +435,6 @@ class RummikubEnv:
                 self.has_melded[self.current_player] = True
                 info['ice_broken'] = True
                 info['tiles_played'] = len(action.tiles)
-                reward += 20  # Ice-breaking bonus
             else:
                 # Invalid meld
                 info['invalid_action'] = True
@@ -443,9 +455,23 @@ class RummikubEnv:
         info['hand_value_after'] = hand_value_after
         info['hand_size_after'] = len(self.player_hands[self.current_player])
         
-        # Apply main reward: R_t = (hand value before) - (hand value after)
+        # Apply reward based on action type (as per user specification)
         if not info['invalid_action']:
-            reward += (hand_value_before - hand_value_after)
+            # Base reward: reduction in hand value
+            base_reward = hand_value_before - hand_value_after
+            
+            if action.action_type == 'draw':
+                # R_t = (hand_before - hand_after) - 5
+                reward = base_reward - 5
+            elif action.action_type == 'initial_meld':
+                # R_t = (hand_before - hand_after) + 20
+                reward = base_reward + 20
+            elif action.action_type == 'play':
+                # R_t = (hand_before - hand_after)
+                reward = base_reward
+            else:
+                # Fallback
+                reward = base_reward
         
         # Check termination conditions
         done = False

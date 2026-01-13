@@ -16,10 +16,6 @@ from Rummikub_ILP_Action_Generator import ActionGenerator, SolverMode
 class HumanPlayer:
     """Interactive human player for testing."""
     
-    def __init__(self):
-        # Create action generator to show legal moves
-        self.action_generator = ActionGenerator(mode=SolverMode.HYBRID, max_ilp_calls=30)
-    
     def select_action(self, env: RummikubEnv) -> RummikubAction:
         """
         Let human select an action interactively.
@@ -39,13 +35,29 @@ class HumanPlayer:
         
         # Get legal actions
         print("\nFinding legal actions...")
-        legal_actions = self.action_generator.generate_all_legal_actions(
-            hand, table, has_melded, pool_size
-        )
+        
+        import time
+        start_time = time.time()
+        legal_actions = env.get_legal_actions(current_player)
+        elapsed = time.time() - start_time
+        
+        print(f"  (Found {len(legal_actions)} actions in {elapsed:.2f}s)")
         
         if len(legal_actions) == 0:
             print("ERROR: No legal actions found!")
             return None
+        
+        # Check if only draw action available
+        play_actions = [a for a in legal_actions if a.action_type != 'draw']
+        if len(play_actions) == 0:
+            if not has_melded:
+                print("\n  ℹ️  No valid initial meld found.")
+                print("      You need sets totaling 30+ points to break the ice.")
+                print(f"      Your hand value: {sum(t.get_value() for t in hand)}")
+                print("      Try: Groups (3-4 same numbers) or Runs (3+ consecutive, same color)")
+            else:
+                print("\n  ℹ️  No valid plays from your hand.")
+                print("      You can only draw this turn.")
         
         # Show legal actions
         print(f"\nYou have {len(legal_actions)} legal actions:")
@@ -90,7 +102,12 @@ class HumanPlayer:
         print(f"\nTable ({len(table)} sets):")
         if table:
             for i, tile_set in enumerate(table):
-                tiles_str = ", ".join(str(t) for t in tile_set.tiles)
+                # Sort tiles for display (especially for runs)
+                display_tiles = tile_set.tiles.copy()
+                if tile_set.set_type == 'run':
+                    # Sort by number for runs
+                    display_tiles.sort(key=lambda t: t.number if t.number else 0)
+                tiles_str = ", ".join(str(t) for t in display_tiles)
                 value = sum(t.get_value() for t in tile_set.tiles if t.tile_type.name != 'JOKER')
                 print(f"  Set {i+1} ({tile_set.set_type}, value={value}): [{tiles_str}]")
         else:
@@ -111,7 +128,11 @@ class HumanPlayer:
             print(f"  [{idx}] INITIAL MELD (value={total_value}):")
             print(f"      Play: {tiles_str}")
             for i, tile_set in enumerate(action.sets):
-                set_tiles = ", ".join(str(t) for t in tile_set.tiles)
+                # Sort for display
+                display_tiles = tile_set.tiles.copy()
+                if tile_set.set_type == 'run':
+                    display_tiles.sort(key=lambda t: t.number if t.number else 0)
+                set_tiles = ", ".join(str(t) for t in display_tiles)
                 print(f"      Set {i+1}: [{set_tiles}] ({tile_set.set_type})")
         
         elif action.action_type == 'play':
@@ -120,9 +141,15 @@ class HumanPlayer:
             print(f"  [{idx}] PLAY {len(action.tiles)} tiles (value={tiles_value}):")
             print(f"      From hand: {tiles_str}")
             
-            # Show if table changed
+            # Show resulting table
             if action.table_config:
-                print(f"      Result: {len(action.table_config)} sets on table")
+                print(f"      Result: {len(action.table_config)} sets on table:")
+                for i, tile_set in enumerate(action.table_config):
+                    display_tiles = tile_set.tiles.copy()
+                    if tile_set.set_type == 'run':
+                        display_tiles.sort(key=lambda t: t.number if t.number else 0)
+                    set_tiles = ", ".join(str(t) for t in display_tiles)
+                    print(f"        Set {i+1}: [{set_tiles}] ({tile_set.set_type})")
 
 
 def play_game():
@@ -136,6 +163,32 @@ def play_game():
     
     # Setup
     env = RummikubEnv(seed=None)  # Random seed for variety
+    
+    # Choose action generator mode
+    print("\nChoose action generator speed:")
+    print("  [1] HEURISTIC_ONLY: Very fast (~10ms), might miss some complex moves")
+    print("  [2] HYBRID: Balanced (~100ms), finds most moves (recommended)")
+    print("  [3] ILP_ONLY: Complete (~1s), finds all moves (slow)")
+    
+    while True:
+        choice = input("Select mode (1/2/3, default=2): ").strip()
+        if choice == '1':
+            mode = SolverMode.HEURISTIC_ONLY
+            print("  Using HEURISTIC_ONLY mode (fast)")
+            break
+        elif choice == '2' or choice == '':
+            mode = SolverMode.HYBRID
+            print("  Using HYBRID mode (balanced)")
+            break
+        elif choice == '3':
+            mode = SolverMode.ILP_ONLY
+            print("  Using ILP_ONLY mode (complete)")
+            break
+        else:
+            print("Invalid choice. Please enter 1, 2, or 3.")
+    
+    # Attach action generator to environment
+    env.action_generator = ActionGenerator(mode=mode, max_ilp_calls=30)
     
     # Choose opponent type
     print("\nChoose opponent:")
