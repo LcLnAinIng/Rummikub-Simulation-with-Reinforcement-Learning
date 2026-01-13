@@ -5,7 +5,7 @@ This allows you to play Rummikub against the ILP baseline opponent
 to test that the environment logic is working correctly.
 
 Usage:
-    python test_human_vs_opponent.py
+    python test.py
 """
 
 from Rummikub_env import RummikubEnv, RummikubAction, TileSet
@@ -64,7 +64,7 @@ class HumanPlayer:
         print()
         
         for i, action in enumerate(legal_actions):
-            self._display_action(i, action)
+            self._display_action(i, action, env)
         
         # Get user choice
         while True:
@@ -117,8 +117,8 @@ class HumanPlayer:
         print(f"Pool: {len(env.tiles_deck)} tiles remaining")
         print(f"Has melded: {env.has_melded[current_player]}")
     
-    def _display_action(self, idx: int, action: RummikubAction):
-        """Display a single action option."""
+    def _display_action(self, idx: int, action: RummikubAction, env: RummikubEnv):
+        """Display a single action option with clear indication of what's from hand."""
         if action.action_type == 'draw':
             print(f"  [{idx}] DRAW a tile from pool")
         
@@ -126,30 +126,77 @@ class HumanPlayer:
             tiles_str = ", ".join(str(t) for t in action.tiles)
             total_value = sum(s.get_meld_value() for s in action.sets)
             print(f"  [{idx}] INITIAL MELD (value={total_value}):")
-            print(f"      Play: {tiles_str}")
+            print(f"      ► Playing from hand: {tiles_str}")
+            print(f"      ► Creating {len(action.sets)} set(s):")
             for i, tile_set in enumerate(action.sets):
                 # Sort for display
                 display_tiles = tile_set.tiles.copy()
                 if tile_set.set_type == 'run':
                     display_tiles.sort(key=lambda t: t.number if t.number else 0)
                 set_tiles = ", ".join(str(t) for t in display_tiles)
-                print(f"      Set {i+1}: [{set_tiles}] ({tile_set.set_type})")
+                set_value = tile_set.get_meld_value()
+                print(f"         • [{set_tiles}] ({tile_set.set_type}, value={set_value})")
         
         elif action.action_type == 'play':
             tiles_str = ", ".join(str(t) for t in action.tiles)
             tiles_value = sum(t.get_value() for t in action.tiles)
             print(f"  [{idx}] PLAY {len(action.tiles)} tiles (value={tiles_value}):")
-            print(f"      From hand: {tiles_str}")
+            print(f"      ► Playing from hand: {tiles_str}")
             
-            # Show resulting table
+            # Determine which sets are new/modified vs unchanged
             if action.table_config:
-                print(f"      Result: {len(action.table_config)} sets on table:")
-                for i, tile_set in enumerate(action.table_config):
-                    display_tiles = tile_set.tiles.copy()
-                    if tile_set.set_type == 'run':
-                        display_tiles.sort(key=lambda t: t.number if t.number else 0)
-                    set_tiles = ", ".join(str(t) for t in display_tiles)
-                    print(f"        Set {i+1}: [{set_tiles}] ({tile_set.set_type})")
+                current_table = env.table
+                hand_tile_ids = set(t.tile_id for t in action.tiles)
+                
+                # Categorize sets
+                new_or_modified = []
+                unchanged = []
+                
+                for tile_set in action.table_config:
+                    set_tile_ids = set(t.tile_id for t in tile_set.tiles)
+                    
+                    # Check if contains hand tiles
+                    has_hand_tile = bool(hand_tile_ids & set_tile_ids)
+                    
+                    if has_hand_tile:
+                        new_or_modified.append(tile_set)
+                    else:
+                        # Check if exactly matches an existing table set
+                        is_unchanged = any(
+                            set_tile_ids == set(t.tile_id for t in table_set.tiles)
+                            for table_set in current_table
+                        )
+                        if is_unchanged:
+                            unchanged.append(tile_set)
+                        else:
+                            # Modified (rearrangement without hand tiles in this set)
+                            new_or_modified.append(tile_set)
+                
+                # Display new/modified sets
+                if new_or_modified:
+                    print(f"      ► NEW/MODIFIED sets:")
+                    for tile_set in new_or_modified:
+                        display_tiles = tile_set.tiles.copy()
+                        if tile_set.set_type == 'run':
+                            display_tiles.sort(key=lambda t: t.number if t.number else 0)
+                        set_tiles = ", ".join(str(t) for t in display_tiles)
+                        
+                        # Count tiles from hand vs table
+                        from_hand = sum(1 for t in tile_set.tiles if t.tile_id in hand_tile_ids)
+                        from_table = len(tile_set.tiles) - from_hand
+                        
+                        if from_table > 0:
+                            detail = f", includes {from_table} from table"
+                        else:
+                            detail = ", all new"
+                        
+                        print(f"         • [{set_tiles}] ({tile_set.set_type}{detail})")
+                
+                # Show unchanged sets count
+                if unchanged:
+                    print(f"      • {len(unchanged)} table set(s) remain unchanged")
+                
+                print(f"      → Final table: {len(action.table_config)} total sets")
 
 
 def play_game():
@@ -165,24 +212,52 @@ def play_game():
     env = RummikubEnv(seed=None)  # Random seed for variety
     
     # Choose action generator mode
-    print("\nChoose action generator speed:")
-    print("  [1] HEURISTIC_ONLY: Very fast (~10ms), might miss some complex moves")
-    print("  [2] HYBRID: Balanced (~100ms), finds most moves (recommended)")
-    print("  [3] ILP_ONLY: Complete (~1s), finds all moves (slow)")
+    print("\n" + "="*70)
+    print("ACTION GENERATOR MODES")
+    print("="*70)
+    print("""
+The Action Generator has 3 modes that balance speed vs completeness:
+
+MODE 1: HEURISTIC_ONLY (Fastest ~10ms)
+  • Uses: Generator 1 (Hand Plays) + Generator 2 (Table Extensions)
+  • Generator 1: Finds all valid sets from YOUR HAND ONLY
+  • Generator 2: Extends EXISTING table sets (add tiles to runs/groups)
+  • Missing: Generator 3 (complex table rearrangements)
+  • Best for: Quick games, simple strategies
+
+MODE 2: HYBRID (Balanced ~100ms) ⭐ RECOMMENDED
+  • Uses: ALL THREE Generators
+  • Generator 1: Hand plays (new sets from hand)
+  • Generator 2: Table extensions (add to existing sets)
+  • Generator 3: Rearrangements (manipulate 1-2 table sets + hand tiles)
+  • Finds most moves without being too slow
+  • Best for: Training RL agents, balanced gameplay
+
+MODE 3: ILP_ONLY (Complete ~1s)
+  • Uses: All generators with HIGHER search limits
+  • Generator 3 explores MORE windows (more thorough)
+  • Finds virtually all possible moves
+  • Best for: Benchmarking, finding optimal plays
+    """)
+    
+    print("Choose action generator mode:")
+    print("  [1] HEURISTIC_ONLY: Very fast (~10ms), might miss complex rearrangements")
+    print("  [2] HYBRID: Balanced (~100ms), finds most moves (RECOMMENDED)")
+    print("  [3] ILP_ONLY: Complete (~1s), finds all moves")
     
     while True:
         choice = input("Select mode (1/2/3, default=2): ").strip()
         if choice == '1':
             mode = SolverMode.HEURISTIC_ONLY
-            print("  Using HEURISTIC_ONLY mode (fast)")
+            print("  Using HEURISTIC_ONLY mode (Generators 1+2)")
             break
         elif choice == '2' or choice == '':
             mode = SolverMode.HYBRID
-            print("  Using HYBRID mode (balanced)")
+            print("  Using HYBRID mode (All generators)")
             break
         elif choice == '3':
             mode = SolverMode.ILP_ONLY
-            print("  Using ILP_ONLY mode (complete)")
+            print("  Using ILP_ONLY mode (Complete search)")
             break
         else:
             print("Invalid choice. Please enter 1, 2, or 3.")
