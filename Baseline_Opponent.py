@@ -438,7 +438,7 @@ class ILPOpponent:
         
         # Build new table configuration
         new_table = []
-        used_tiles = set()
+        used_tile_ids = []  # Use list to track tile IDs (allows duplicates for counting)
         
         for j, var in x_vars.items():
             count = int(var.solution_value())
@@ -446,22 +446,26 @@ class ILPOpponent:
                 set_template = self.all_possible_sets[j]
                 
                 for _ in range(count):
-                    tile_set = self._instantiate_set(set_template, tile_inventory, used_tiles)
+                    tile_set = self._instantiate_set(set_template, tile_inventory, set(used_tile_ids))
                     if tile_set:
                         new_table.append(tile_set)
                         for tile in tile_set.tiles:
-                            used_tiles.add(tile.tile_id)
+                            used_tile_ids.append(tile.tile_id)  # Append to list (allows duplicates)
+        
+        # Count occurrences of each tile_id
+        from collections import Counter
+        used_tile_counts = Counter(used_tile_ids)
         
         # Determine which hand tiles were played
         hand_tiles_played = []
         for tile in hand_tiles:
-            # Check if this tile appears in used_tiles more than it appears on table
-            if tile.tile_id in used_tiles:
-                times_in_used = list(used_tiles).count(tile.tile_id)
-                times_on_table = tile_inventory[tile.tile_id]['on_table']
-                
-                if times_in_used > times_on_table:
-                    hand_tiles_played.append(tile)
+            # Check if this tile appears in new table MORE than on old table
+            times_in_new_table = used_tile_counts.get(tile.tile_id, 0)
+            times_on_old_table = tile_inventory[tile.tile_id]['on_table']
+            
+            # If appears MORE times in new table, it came from hand
+            if times_in_new_table > times_on_old_table:
+                hand_tiles_played.append(tile)
         
         if not new_table or not hand_tiles_played:
             return None
@@ -480,33 +484,186 @@ class ILPOpponent:
     # =========================================================================
     
     def _generate_all_set_templates(self):
-        """Generate all possible set templates (simplified)."""
+        """
+        Generate all possible set templates INCLUDING JOKERS.
+        
+        Based on academic paper approach:
+        - Runs of length 3-5 with 0, 1, or 2 jokers
+        - Groups of size 3-4 with 0, 1, or 2 jokers
+        
+        This allows ILP to find joker manipulation strategies.
+        """
         from Rummikub_ILP_Action_Generator import SetTemplate
         from itertools import combinations
         
         templates = []
         template_id = 0
         
-        # RUNS (simplified - length 3, 4, 5 without jokers)
+        # =====================================================================
+        # RUNS (with and without jokers)
+        # =====================================================================
+        
         for color in range(4):
-            for start in range(1, 12):
-                templates.append(SetTemplate('run', [(color, start+i) for i in range(3)], 0, template_id))
+            # Length 3 runs
+            for start in range(1, 12):  # 1-11 start positions
+                # Without jokers
+                templates.append(SetTemplate(
+                    'run', 
+                    [(color, start+i) for i in range(3)], 
+                    0, template_id))
                 template_id += 1
-            for start in range(1, 11):
-                templates.append(SetTemplate('run', [(color, start+i) for i in range(4)], 0, template_id))
+                
+                # With 1 joker (3 positions)
+                for joker_pos in range(3):
+                    pattern = []
+                    for i in range(3):
+                        if i == joker_pos:
+                            pattern.append(('JOKER', 'JOKER'))
+                        else:
+                            pattern.append((color, start+i))
+                    templates.append(SetTemplate('run', pattern, 1, template_id))
+                    template_id += 1
+                
+                # With 2 jokers (3 combinations)
+                for joker_pos1, joker_pos2 in combinations(range(3), 2):
+                    pattern = []
+                    for i in range(3):
+                        if i in (joker_pos1, joker_pos2):
+                            pattern.append(('JOKER', 'JOKER'))
+                        else:
+                            pattern.append((color, start+i))
+                    templates.append(SetTemplate('run', pattern, 2, template_id))
+                    template_id += 1
+            
+            # Length 4 runs
+            for start in range(1, 11):  # 1-10 start positions
+                # Without jokers
+                templates.append(SetTemplate(
+                    'run',
+                    [(color, start+i) for i in range(4)],
+                    0, template_id))
                 template_id += 1
-            for start in range(1, 10):
-                templates.append(SetTemplate('run', [(color, start+i) for i in range(5)], 0, template_id))
+                
+                # With 1 joker (4 positions)
+                for joker_pos in range(4):
+                    pattern = []
+                    for i in range(4):
+                        if i == joker_pos:
+                            pattern.append(('JOKER', 'JOKER'))
+                        else:
+                            pattern.append((color, start+i))
+                    templates.append(SetTemplate('run', pattern, 1, template_id))
+                    template_id += 1
+                
+                # With 2 jokers (6 combinations)
+                for joker_pos1, joker_pos2 in combinations(range(4), 2):
+                    pattern = []
+                    for i in range(4):
+                        if i in (joker_pos1, joker_pos2):
+                            pattern.append(('JOKER', 'JOKER'))
+                        else:
+                            pattern.append((color, start+i))
+                    templates.append(SetTemplate('run', pattern, 2, template_id))
+                    template_id += 1
+            
+            # Length 5 runs
+            for start in range(1, 10):  # 1-9 start positions
+                # Without jokers
+                templates.append(SetTemplate(
+                    'run',
+                    [(color, start+i) for i in range(5)],
+                    0, template_id))
                 template_id += 1
+                
+                # With 1 joker (5 positions)
+                for joker_pos in range(5):
+                    pattern = []
+                    for i in range(5):
+                        if i == joker_pos:
+                            pattern.append(('JOKER', 'JOKER'))
+                        else:
+                            pattern.append((color, start+i))
+                    templates.append(SetTemplate('run', pattern, 1, template_id))
+                    template_id += 1
+                
+                # With 2 jokers (10 combinations)
+                for joker_pos1, joker_pos2 in combinations(range(5), 2):
+                    pattern = []
+                    for i in range(5):
+                        if i in (joker_pos1, joker_pos2):
+                            pattern.append(('JOKER', 'JOKER'))
+                        else:
+                            pattern.append((color, start+i))
+                    templates.append(SetTemplate('run', pattern, 2, template_id))
+                    template_id += 1
         
-        # GROUPS (without jokers)
-        for number in range(1, 14):
+        # =====================================================================
+        # GROUPS (with and without jokers)
+        # =====================================================================
+        
+        for number in range(1, 14):  # Numbers 1-13
+            # Size 3 groups
             for color_combo in combinations(range(4), 3):
-                templates.append(SetTemplate('group', [(c, number) for c in color_combo], 0, template_id))
+                # Without jokers
+                templates.append(SetTemplate(
+                    'group',
+                    [(c, number) for c in color_combo],
+                    0, template_id))
                 template_id += 1
-            templates.append(SetTemplate('group', [(c, number) for c in range(4)], 0, template_id))
+                
+                # With 1 joker (replace each color with joker)
+                for skip_idx in range(3):
+                    pattern = []
+                    for i, c in enumerate(color_combo):
+                        if i == skip_idx:
+                            pattern.append(('JOKER', 'JOKER'))
+                        else:
+                            pattern.append((c, number))
+                    templates.append(SetTemplate('group', pattern, 1, template_id))
+                    template_id += 1
+                
+                # With 2 jokers (replace two colors with jokers)
+                for skip_idx1, skip_idx2 in combinations(range(3), 2):
+                    pattern = []
+                    for i, c in enumerate(color_combo):
+                        if i in (skip_idx1, skip_idx2):
+                            pattern.append(('JOKER', 'JOKER'))
+                        else:
+                            pattern.append((c, number))
+                    templates.append(SetTemplate('group', pattern, 2, template_id))
+                    template_id += 1
+            
+            # Size 4 groups (all colors)
+            # Without jokers
+            templates.append(SetTemplate(
+                'group',
+                [(c, number) for c in range(4)],
+                0, template_id))
             template_id += 1
+            
+            # With 1 joker (replace each color with joker)
+            for skip_idx in range(4):
+                pattern = []
+                for i in range(4):
+                    if i == skip_idx:
+                        pattern.append(('JOKER', 'JOKER'))
+                    else:
+                        pattern.append((i, number))
+                templates.append(SetTemplate('group', pattern, 1, template_id))
+                template_id += 1
+            
+            # With 2 jokers (replace two colors with jokers)
+            for skip_idx1, skip_idx2 in combinations(range(4), 2):
+                pattern = []
+                for i in range(4):
+                    if i in (skip_idx1, skip_idx2):
+                        pattern.append(('JOKER', 'JOKER'))
+                    else:
+                        pattern.append((i, number))
+                templates.append(SetTemplate('group', pattern, 2, template_id))
+                template_id += 1
         
+        print(f"Generated {template_id} set templates (including joker scenarios)")
         return templates
     
     def _build_constraint_matrix(self, tile_inventory):
